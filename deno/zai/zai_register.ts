@@ -226,13 +226,132 @@ function parseVerificationUrl(url: string): { token: string | null; email: strin
   }
 }
 
-async function saveAccount(email: string, password: string, token: string): Promise<void> {
+/**
+ * API登录功能 - 移植自Python版本
+ * 使用用户Token登录到API获取access_token
+ */
+async function loginToApi(token: string): Promise<string | null> {
+  const url = 'https://api.z.ai/api/auth/z/login';
+  const headers = {
+    'User-Agent': 'Mozilla/5.0',
+    'Origin': 'https://z.ai',
+    'Referer': 'https://z.ai/',
+    'Content-Type': 'application/json'
+  };
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ token }),
+      signal: AbortSignal.timeout(15000)  // 15秒超时
+    });
+
+    const result = await response.json();
+    if (result.success && result.code === 200) {
+      const accessToken = result.data?.access_token;
+      if (accessToken) {
+        broadcast({ type: 'log', level: 'success', message: `  ✓ API登录成功` });
+        return accessToken;
+      }
+    }
+    broadcast({ type: 'log', level: 'error', message: `  ✗ API登录失败: ${JSON.stringify(result)}` });
+    return null;
+  } catch (error) {
+    broadcast({ type: 'log', level: 'error', message: `  ✗ API登录异常: ${error}` });
+    return null;
+  }
+}
+
+/**
+ * 获取客户信息 - 移植自Python版本
+ * 获取组织ID和项目ID用于创建API密钥
+ */
+async function getCustomerInfo(accessToken: string): Promise<{ orgId: string | null; projectId: string | null }> {
+  const url = 'https://api.z.ai/api/biz/customer/getCustomerInfo';
+  const headers = {
+    'Authorization': `Bearer ${accessToken}`,
+    'User-Agent': 'Mozilla/5.0',
+    'Origin': 'https://z.ai',
+    'Referer': 'https://z.ai/'
+  };
+
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers,
+      signal: AbortSignal.timeout(20000)  // 20秒超时
+    });
+
+    const result = await response.json();
+    if (result.success && result.code === 200) {
+      const orgs = result.data?.organizations || [];
+      if (orgs.length > 0) {
+        const orgId = orgs[0].organizationId;
+        const projects = orgs[0].projects || [];
+        const projectId = projects.length > 0 ? projects[0].projectId : null;
+
+        if (orgId && projectId) {
+          broadcast({ type: 'log', level: 'success', message: `  ✓ 获取客户信息成功` });
+          return { orgId, projectId };
+        }
+      }
+    }
+    broadcast({ type: 'log', level: 'error', message: `  ✗ 获取客户信息失败: ${JSON.stringify(result)}` });
+    return { orgId: null, projectId: null };
+  } catch (error) {
+    broadcast({ type: 'log', level: 'error', message: `  ✗ 获取客户信息异常: ${error}` });
+    return { orgId: null, projectId: null };
+  }
+}
+
+/**
+ * 创建API密钥 - 移植自Python版本
+ * 生成最终的API密钥
+ */
+async function createApiKey(accessToken: string, orgId: string, projectId: string): Promise<string | null> {
+  const url = `https://api.z.ai/api/biz/v1/organization/${orgId}/projects/${projectId}/api_keys`;
+  const headers = {
+    'Authorization': `Bearer ${accessToken}`,
+    'Content-Type': 'application/json',
+    'User-Agent': 'Mozilla/5.0',
+    'Origin': 'https://z.ai',
+    'Referer': 'https://z.ai/'
+  };
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ name: 'auto_generated_key' }),
+      signal: AbortSignal.timeout(30000)  // 30秒超时
+    });
+
+    const result = await response.json();
+    if (result.success && result.code === 200) {
+      const apiKeyData = result.data || {};
+      const finalKey = `${apiKeyData.apiKey}.${apiKeyData.secretKey}`;
+      if (finalKey && finalKey !== 'undefined.undefined') {
+        broadcast({ type: 'log', level: 'success', message: `  ✓ API密钥创建成功` });
+        return finalKey;
+      }
+    }
+    broadcast({ type: 'log', level: 'error', message: `  ✗ 创建API密钥失败: ${JSON.stringify(result)}` });
+    return null;
+  } catch (error) {
+    broadcast({ type: 'log', level: 'error', message: `  ✗ 创建API密钥异常: ${error}` });
+    return null;
+  }
+}
+
+async function saveAccount(email: string, password: string, token: string, apikey?: string): Promise<void> {
   const timestamp = Date.now();
   const key = ["zai_accounts", timestamp, email];
   await kv.set(key, {
     email,
     password,
     token,
+    apikey: apikey || null,  // 新增 APIKEY 字段
     createdAt: new Date().toISOString()
   });
 }
@@ -372,23 +491,77 @@ async function registerAccount(): Promise<boolean> {
       return false;
     }
 
-    // 5. 保存
+    // 5. 获取用户Token
     const userToken = finishResult.user?.token;
-    if (userToken) {
+    if (!userToken) {
+      broadcast({ type: 'log', level: 'error', message: `  ✗ 未获取到用户Token` });
+      stats.failed++;
+      return false;
+    }
+
+    broadcast({ type: 'log', level: 'success', message: `  ✓ 获得用户Token` });
+
+    // 6. API登录
+    broadcast({ type: 'log', level: 'info', message: `  → 登录API平台...` });
+    const accessToken = await loginToApi(userToken);
+    if (!accessToken) {
+      // 即使API登录失败，也保存账号（只有Token，没有APIKEY）
       await saveAccount(email, password, userToken);
       stats.success++;
       broadcast({
         type: 'log',
-        level: 'success',
-        message: `✅ 注册完成: ${email}`,
+        level: 'warning',
+        message: `⚠️ 注册成功但API登录失败: ${email} (仅获取Token)`,
         stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed }
       });
-      broadcast({ type: 'account_added', account: { email, password, token: userToken, createdAt: new Date().toISOString() } });
+      broadcast({ type: 'account_added', account: { email, password, token: userToken, apikey: null, createdAt: new Date().toISOString() } });
       return true;
     }
 
-    stats.failed++;
-    return false;
+    // 7. 获取客户信息
+    broadcast({ type: 'log', level: 'info', message: `  → 获取组织信息...` });
+    const { orgId, projectId } = await getCustomerInfo(accessToken);
+    if (!orgId || !projectId) {
+      // 保存账号（只有Token，没有APIKEY）
+      await saveAccount(email, password, userToken);
+      stats.success++;
+      broadcast({
+        type: 'log',
+        level: 'warning',
+        message: `⚠️ 注册成功但获取组织信息失败: ${email} (仅获取Token)`,
+        stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed }
+      });
+      broadcast({ type: 'account_added', account: { email, password, token: userToken, apikey: null, createdAt: new Date().toISOString() } });
+      return true;
+    }
+
+    // 8. 创建API密钥
+    broadcast({ type: 'log', level: 'info', message: `  → 创建API密钥...` });
+    const apiKey = await createApiKey(accessToken, orgId, projectId);
+
+    // 9. 保存完整账号信息
+    await saveAccount(email, password, userToken, apiKey || undefined);
+    stats.success++;
+
+    if (apiKey) {
+      broadcast({
+        type: 'log',
+        level: 'success',
+        message: `✅ 注册完成: ${email} (包含APIKEY)`,
+        stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed }
+      });
+      broadcast({ type: 'account_added', account: { email, password, token: userToken, apikey: apiKey, createdAt: new Date().toISOString() } });
+    } else {
+      broadcast({
+        type: 'log',
+        level: 'warning',
+        message: `⚠️ 注册成功但创建API密钥失败: ${email} (仅获取Token)`,
+        stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed }
+      });
+      broadcast({ type: 'account_added', account: { email, password, token: userToken, apikey: null, createdAt: new Date().toISOString() } });
+    }
+
+    return true;
   } catch (error: any) {
     const msg = error instanceof Error ? error.message : String(error);
     broadcast({ type: 'log', level: 'error', message: `  ✗ 异常: ${msg}` });
@@ -723,13 +896,14 @@ const HTML_PAGE = `<!DOCTYPE html>
                             <th class="px-4 py-3 text-sm font-semibold text-gray-700">邮箱</th>
                             <th class="px-4 py-3 text-sm font-semibold text-gray-700">密码</th>
                             <th class="px-4 py-3 text-sm font-semibold text-gray-700">Token</th>
+                            <th class="px-4 py-3 text-sm font-semibold text-gray-700">APIKEY</th>
                             <th class="px-4 py-3 text-sm font-semibold text-gray-700">创建时间</th>
                             <th class="px-4 py-3 text-sm font-semibold text-gray-700">操作</th>
                         </tr>
                     </thead>
                     <tbody id="accountTableBody" class="divide-y divide-gray-200">
                         <tr>
-                            <td colspan="6" class="px-4 py-8 text-center text-gray-400">暂无数据</td>
+                            <td colspan="7" class="px-4 py-8 text-center text-gray-400">暂无数据</td>
                         </tr>
                     </tbody>
                 </table>
@@ -895,19 +1069,26 @@ const HTML_PAGE = `<!DOCTYPE html>
             const pageData = data.slice(startIndex, endIndex);
 
             if (pageData.length === 0) {
-                $accountTableBody.html('<tr><td colspan="6" class="px-4 py-8 text-center text-gray-400">暂无数据</td></tr>');
+                $accountTableBody.html('<tr><td colspan="7" class="px-4 py-8 text-center text-gray-400">暂无数据</td></tr>');
             } else {
                 const rows = pageData.map((acc, idx) => {
                     const rowId = 'row-' + (startIndex + idx);
+                    // 处理APIKEY显示
+                    const apikeyDisplay = acc.apikey ?
+                        '<code class="bg-gray-100 px-2 py-1 rounded text-xs">' + acc.apikey.substring(0, 20) + '...</code>' :
+                        '<span class="text-gray-400 text-xs">未生成</span>';
+
                     return '<tr class="hover:bg-gray-50" id="' + rowId + '">' +
                         '<td class="px-4 py-3 text-sm text-gray-700">' + (startIndex + idx + 1) + '</td>' +
                         '<td class="px-4 py-3 text-sm text-gray-700">' + acc.email + '</td>' +
                         '<td class="px-4 py-3 text-sm text-gray-700"><code class="bg-gray-100 px-2 py-1 rounded">' + acc.password + '</code></td>' +
                         '<td class="px-4 py-3 text-sm text-gray-700"><code class="bg-gray-100 px-2 py-1 rounded text-xs">' + acc.token.substring(0, 20) + '...</code></td>' +
+                        '<td class="px-4 py-3 text-sm text-gray-700">' + apikeyDisplay + '</td>' +
                         '<td class="px-4 py-3 text-sm text-gray-700">' + new Date(acc.createdAt).toLocaleString('zh-CN') + '</td>' +
                         '<td class="px-4 py-3 flex gap-2">' +
                             '<button class="copy-account-btn text-blue-600 hover:text-blue-800 text-sm font-medium" data-email="' + acc.email + '" data-password="' + acc.password + '">复制账号</button>' +
                             '<button class="copy-token-btn text-green-600 hover:text-green-800 text-sm font-medium" data-token="' + acc.token + '">复制Token</button>' +
+                            (acc.apikey ? '<button class="copy-apikey-btn text-purple-600 hover:text-purple-800 text-sm font-medium" data-apikey="' + acc.apikey + '">复制APIKEY</button>' : '') +
                         '</td>' +
                     '</tr>';
                 });
@@ -925,6 +1106,12 @@ const HTML_PAGE = `<!DOCTYPE html>
                     const token = $(this).data('token');
                     navigator.clipboard.writeText(token);
                     showToast('已复制 Token', 'success');
+                });
+
+                $('.copy-apikey-btn').on('click', function() {
+                    const apikey = $(this).data('apikey');
+                    navigator.clipboard.writeText(apikey);
+                    showToast('已复制 APIKEY', 'success');
                 });
             }
 
@@ -1387,7 +1574,13 @@ async function handler(req: Request): Promise<Response> {
     const entries = kv.list({ prefix: ["zai_accounts"] });
     for await (const entry of entries) {
       const data = entry.value as any;
-      lines.push(`${data.email}----${data.password}----${data.token}`);
+      // 支持四字段格式：账号----密码----Token----APIKEY
+      if (data.apikey) {
+        lines.push(`${data.email}----${data.password}----${data.token}----${data.apikey}`);
+      } else {
+        // 兼容旧格式，APIKEY为空
+        lines.push(`${data.email}----${data.password}----${data.token}----`);
+      }
     }
     return new Response(lines.join('\n'), {
       headers: {
@@ -1401,7 +1594,7 @@ async function handler(req: Request): Promise<Response> {
   if (url.pathname === "/api/import" && req.method === "POST") {
     try {
       const body = await req.json();
-      const { email, password, token } = body;
+      const { email, password, token, apikey } = body;
 
       if (!email || !password || !token) {
         return new Response(JSON.stringify({ success: false, error: "缺少必要字段" }), {
@@ -1417,6 +1610,7 @@ async function handler(req: Request): Promise<Response> {
         email,
         password,
         token,
+        apikey: apikey || null,  // 支持APIKEY字段
         createdAt: new Date().toISOString()
       });
 
@@ -1459,7 +1653,7 @@ async function handler(req: Request): Promise<Response> {
       const timestamp = Date.now();
 
       for (const [index, acc] of importAccounts.entries()) {
-        const { email, password, token } = acc;
+        const { email, password, token, apikey } = acc;
 
         if (!email || !password || !token) {
           skipped++;
@@ -1478,6 +1672,7 @@ async function handler(req: Request): Promise<Response> {
           email,
           password,
           token,
+          apikey: apikey || null,  // 支持APIKEY字段
           createdAt: new Date().toISOString()
         });
 
