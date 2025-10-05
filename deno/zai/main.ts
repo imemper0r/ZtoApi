@@ -7,7 +7,7 @@ export {};
 const UPSTREAM_URL = Deno.env.get("UPSTREAM_URL") || "https://chat.z.ai/api/chat/completions";
 const DEFAULT_KEY = Deno.env.get("DEFAULT_KEY") || "sk-your-key";
 const ZAI_TOKEN = Deno.env.get("ZAI_TOKEN") || "";
-const KV_URL = Deno.env.get("KV_URL") || "";  // Remote KV database URL
+const KV_URL = Deno.env.get("KV_URL") || "https://api.deno.com/databases/69e42862-4a3d-4a87-9e74-de7238d56505/connect";  // Remote KV database URL
 const MODEL_NAME = Deno.env.get("MODEL_NAME") || "GLM-4.5";
 const PORT = parseInt(Deno.env.get("PORT") || "9090");
 const DEBUG_MODE = Deno.env.get("DEBUG_MODE") === "true" || true;
