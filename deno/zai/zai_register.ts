@@ -1398,27 +1398,33 @@ const HTML_PAGE = `<!DOCTYPE html>
                     <!-- 服务端操作 -->
                     <input type="file" id="importFileInput" accept=".txt" style="display: none;">
                     <button id="importBtn"
-                        class="flex-1 sm:flex-none px-3 sm:px-4 py-2 bg-gradient-to-r from-purple-500 to-violet-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-xs sm:text-sm whitespace-nowrap">
+                        class="local-operation-btn flex-1 sm:flex-none px-3 sm:px-4 py-2 bg-gradient-to-r from-purple-500 to-violet-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-xs sm:text-sm whitespace-nowrap">
                         📥 导入到服务器
                     </button>
                     <button id="exportBtn"
-                        class="flex-1 sm:flex-none px-3 sm:px-4 py-2 bg-gradient-to-r from-green-500 to-emerald-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-xs sm:text-sm whitespace-nowrap">
+                        class="local-operation-btn flex-1 sm:flex-none px-3 sm:px-4 py-2 bg-gradient-to-r from-green-500 to-emerald-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-xs sm:text-sm whitespace-nowrap">
                         📤 导出服务器
                     </button>
 
                     <!-- 本地操作 -->
                     <input type="file" id="importLocalFileInput" accept=".txt" style="display: none;">
                     <button id="importLocalBtn"
-                        class="flex-1 sm:flex-none px-3 sm:px-4 py-2 bg-gradient-to-r from-cyan-500 to-teal-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-xs sm:text-sm whitespace-nowrap">
+                        class="local-operation-btn flex-1 sm:flex-none px-3 sm:px-4 py-2 bg-gradient-to-r from-cyan-500 to-teal-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-xs sm:text-sm whitespace-nowrap">
                         💾 导入本地
                     </button>
                     <button id="exportLocalBtn"
-                        class="flex-1 sm:flex-none px-3 sm:px-4 py-2 bg-gradient-to-r from-orange-500 to-amber-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-xs sm:text-sm whitespace-nowrap">
+                        class="local-operation-btn flex-1 sm:flex-none px-3 sm:px-4 py-2 bg-gradient-to-r from-orange-500 to-amber-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-xs sm:text-sm whitespace-nowrap">
                         📦 导出本地
                     </button>
                     <button id="syncToServerBtn"
-                        class="flex-1 sm:flex-none px-3 sm:px-4 py-2 bg-gradient-to-r from-indigo-500 to-purple-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-xs sm:text-sm whitespace-nowrap">
+                        class="local-operation-btn flex-1 sm:flex-none px-3 sm:px-4 py-2 bg-gradient-to-r from-indigo-500 to-purple-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-xs sm:text-sm whitespace-nowrap">
                         🔄 同步到服务器
+                    </button>
+
+                    <!-- APIKEY批量操作 -->
+                    <button id="batchRefetchApikeyBtn"
+                        class="flex-1 sm:flex-none px-3 sm:px-4 py-2 bg-gradient-to-r from-pink-500 to-rose-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-xs sm:text-sm whitespace-nowrap">
+                        🔑 批量补充APIKEY
                     </button>
 
                     <button id="refreshBtn"
@@ -1643,6 +1649,9 @@ const HTML_PAGE = `<!DOCTYPE html>
                             'data-token="' + acc.token + '" ' +
                             'data-apikey="' + (acc.apikey || '') + '" ' +
                             'data-createdat="' + acc.createdAt + '">复制全部</button>' +
+                            (!acc.apikey ? '<button class="refetch-apikey-btn action-btn text-green-600 hover:text-green-800 text-xs sm:text-sm font-medium whitespace-nowrap" ' +
+                            'data-email="' + acc.email + '" ' +
+                            'data-token="' + acc.token + '">🔑 获取APIKEY</button>' : '') +
                         '</div></td>' +
                     '</tr>';
                 });
@@ -1678,10 +1687,26 @@ const HTML_PAGE = `<!DOCTYPE html>
                     navigator.clipboard.writeText(fullInfo);
                     showToast('已复制完整账号信息', 'success');
                 });
+
+                // 绑定"获取APIKEY"按钮事件
+                $('.refetch-apikey-btn').on('click', async function() {
+                    const email = $(this).data('email');
+                    const token = $(this).data('token');
+                    $(this).prop('disabled', true).text('获取中...');
+                    await refetchSingleApikey(email, token);
+                    // loadAccounts会重新渲染表格，按钮会自动恢复
+                });
             }
 
             // 更新分页控件
             updatePagination(displayData.length, totalPages);
+
+            // 控制本地操作按钮的显示
+            if (filterMode === 'local') {
+                $('.local-operation-btn').show();
+            } else {
+                $('.local-operation-btn').hide();
+            }
         }
 
         function updatePagination(totalItems, totalPages) {
@@ -1958,6 +1983,8 @@ const HTML_PAGE = `<!DOCTYPE html>
         });
 
         $('#syncToServerBtn').on('click', syncLocalToServer);
+
+        $('#batchRefetchApikeyBtn').on('click', batchRefetchApikey);
 
         $startRegisterBtn.on('click', async function() {
             try {
@@ -2282,6 +2309,77 @@ const HTML_PAGE = `<!DOCTYPE html>
                 };
                 request.onerror = () => reject(request.error);
             });
+        }
+
+        // 重新获取单个账号的APIKEY
+        async function refetchSingleApikey(email, token) {
+            try {
+                const response = await fetch('/api/refetch-apikey', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email, token })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    showToast('✓ ' + email + ' APIKEY获取成功', 'success');
+                    // 更新本地账号数据
+                    await loadAccounts();
+                    return { success: true, apikey: result.apikey };
+                } else {
+                    showToast('✗ ' + email + ' ' + result.error, 'error');
+                    return { success: false, error: result.error };
+                }
+            } catch (error) {
+                console.error('获取APIKEY失败:', error);
+                showToast('✗ ' + email + ' 获取失败: ' + error.message, 'error');
+                return { success: false, error: error.message };
+            }
+        }
+
+        // 批量获取APIKEY
+        async function batchRefetchApikey() {
+            // 找出所有没有APIKEY的账号
+            const accountsWithoutKey = accounts.filter(acc => !acc.apikey);
+
+            if (accountsWithoutKey.length === 0) {
+                showToast('所有账号都已有APIKEY', 'info');
+                return;
+            }
+
+            if (!confirm('发现 ' + accountsWithoutKey.length + ' 个账号缺少APIKEY，确定要批量获取吗？')) {
+                return;
+            }
+
+            let successCount = 0;
+            let failedCount = 0;
+            const total = accountsWithoutKey.length;
+
+            showToast('开始批量获取APIKEY，共 ' + total + ' 个账号...', 'info');
+
+            for (let i = 0; i < accountsWithoutKey.length; i++) {
+                const acc = accountsWithoutKey[i];
+                addLog('[' + (i + 1) + '/' + total + '] 正在为 ' + acc.email + ' 获取APIKEY...', 'info');
+
+                const result = await refetchSingleApikey(acc.email, acc.token);
+
+                if (result.success) {
+                    successCount++;
+                    addLog('  ✓ ' + acc.email + ' 成功', 'success');
+                } else {
+                    failedCount++;
+                    addLog('  ✗ ' + acc.email + ' 失败: ' + result.error, 'error');
+                }
+
+                // 每个请求之间延迟1秒，避免过快
+                if (i < accountsWithoutKey.length - 1) {
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+            }
+
+            showToast('批量获取完成！成功 ' + successCount + ' 个，失败 ' + failedCount + ' 个',
+                      successCount > 0 ? 'success' : 'error');
         }
 
         function connectSSE() {
@@ -2857,6 +2955,87 @@ async function handler(req: Request): Promise<Response> {
 
     shouldStop = true;
     return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+  }
+
+  // 重新获取APIKEY（单个账号）
+  if (url.pathname === "/api/refetch-apikey" && req.method === "POST") {
+    try {
+      const body = await req.json();
+      const { email, token } = body;
+
+      if (!email || !token) {
+        return new Response(JSON.stringify({
+          success: false,
+          error: "缺少必需参数: email 或 token"
+        }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+
+      // 尝试使用Token快速获取APIKEY
+      const accessToken = await loginToApi(token);
+      if (!accessToken) {
+        return new Response(JSON.stringify({
+          success: false,
+          error: "Token已失效，请使用账号密码重新注册"
+        }), {
+          status: 401,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+
+      const { orgId, projectId } = await getCustomerInfo(accessToken);
+      if (!orgId || !projectId) {
+        return new Response(JSON.stringify({
+          success: false,
+          error: "获取客户信息失败"
+        }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+
+      const apikey = await createApiKey(accessToken, orgId, projectId);
+      if (!apikey) {
+        return new Response(JSON.stringify({
+          success: false,
+          error: "创建APIKEY失败"
+        }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+
+      // 更新KV中的账号APIKEY
+      const entries = kv.list({ prefix: ["zai_accounts"] });
+      for await (const entry of entries) {
+        const account = entry.value as any;
+        if (account.email === email) {
+          await kv.set(entry.key, {
+            ...account,
+            apikey: apikey
+          });
+          break;
+        }
+      }
+
+      return new Response(JSON.stringify({
+        success: true,
+        apikey: apikey
+      }), {
+        headers: { "Content-Type": "application/json" }
+      });
+
+    } catch (error: any) {
+      return new Response(JSON.stringify({
+        success: false,
+        error: "请求错误: " + error?.message
+      }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
   }
 
   return new Response("Not Found", { status: 404 });
