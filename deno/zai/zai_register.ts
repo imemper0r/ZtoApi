@@ -61,6 +61,89 @@ let isRunning = false;  // 注册任务是否正在运行
 let shouldStop = false;  // 是否请求停止注册
 const sseClients = new Set<ReadableStreamDefaultController>();  // SSE 客户端连接池
 let stats = { success: 0, failed: 0, startTime: 0, lastNotifyTime: 0 };  // 统计信息
+const logHistory: any[] = [];  // 日志历史记录（内存缓存）
+const MAX_LOG_HISTORY = 500;  // 最大日志条数
+let logSaveTimer: number | null = null;  // 日志保存定时器
+const LOG_SAVE_INTERVAL = 30000;  // 日志保存间隔（30秒）
+
+/**
+ * 批量保存日志到 KV（节流）
+ */
+async function saveLogs(): Promise<void> {
+  if (logHistory.length === 0) return;
+
+  try {
+    const logKey = ["logs", "recent"];
+    const now = Date.now();
+
+    // 只保存最近1小时的日志，并过滤旧数据
+    const oneHourAgo = now - 3600000;
+    const recentLogs = logHistory
+      .filter(log => log.timestamp > oneHourAgo)
+      .slice(-200);
+
+    if (recentLogs.length > 0) {
+      await kv.set(logKey, recentLogs, { expireIn: 3600000 });  // 1小时过期
+    } else {
+      // 如果没有新日志，删除旧key
+      await kv.delete(logKey);
+    }
+  } catch (error) {
+    console.error("保存日志失败:", error);
+  }
+}
+
+/**
+ * 调度日志保存（防抖）
+ */
+function scheduleSaveLogs() {
+  if (logSaveTimer) {
+    clearTimeout(logSaveTimer);
+  }
+
+  logSaveTimer = setTimeout(() => {
+    saveLogs();
+    logSaveTimer = null;
+  }, LOG_SAVE_INTERVAL);
+}
+
+/**
+ * 广播消息并自动保存日志
+ */
+function broadcast(data: any) {
+  const message = `data: ${JSON.stringify(data)}\n\n`;
+  for (const controller of sseClients) {
+    try {
+      controller.enqueue(new TextEncoder().encode(message));
+    } catch {
+      sseClients.delete(controller);
+    }
+  }
+
+  // 保存到内存
+  if (data.type === 'log' || data.type === 'start' || data.type === 'complete') {
+    logHistory.push({ ...data, timestamp: Date.now() });
+
+    // 清理超过1小时的旧日志（内存）
+    const oneHourAgo = Date.now() - 3600000;
+    while (logHistory.length > 0 && logHistory[0].timestamp < oneHourAgo) {
+      logHistory.shift();
+    }
+
+    // 限制最大数量
+    if (logHistory.length > MAX_LOG_HISTORY) {
+      logHistory.shift();
+    }
+
+    // 调度批量保存（节流，30秒一次）
+    scheduleSaveLogs();
+
+    // 在任务完成或停止时立即保存
+    if (data.type === 'complete' || (data.type === 'log' && data.level === 'error')) {
+      saveLogs().catch(() => {});
+    }
+  }
+}
 
 /**
  * 生成唯一的 Session ID
@@ -75,7 +158,7 @@ let registerConfig = {
   emailCheckInterval: 1,  // 邮件轮询间隔（秒）
   registerDelay: 2000,  // 每个账号注册间隔（毫秒）
   retryTimes: 3,  // API 重试次数
-  concurrency: 1,  // 并发数（1-10）
+  concurrency: 10,  // 并发数（1-10）
   enableNotification: false,  // 是否启用通知（默认关闭）
   pushplusToken: "",  // PushPlus Token（需要用户自行配置）
 };
@@ -155,17 +238,6 @@ async function sendNotification(title: string, content: string): Promise<void> {
   }
 }
 
-function broadcast(data: any) {
-  const message = `data: ${JSON.stringify(data)}\n\n`;
-  for (const controller of sseClients) {
-    try {
-      controller.enqueue(new TextEncoder().encode(message));
-    } catch {
-      sseClients.delete(controller);
-    }
-  }
-}
-
 /**
  * 获取验证邮件
  * @param email 邮箱地址
@@ -181,6 +253,14 @@ async function fetchVerificationEmail(email: string): Promise<string | null> {
   let lastReportTime = 0;  // 上次报告进度的时间
   const reportInterval = 10;  // 每 10 秒报告一次进度
 
+  // 格式化时间显示
+  const formatTime = (seconds: number): string => {
+    if (seconds < 60) return `${seconds}s`;
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}m${secs}s`;
+  };
+
   while (Date.now() - startTime < actualTimeout * 1000) {
     attempts++;
     try {
@@ -190,7 +270,13 @@ async function fetchVerificationEmail(email: string): Promise<string | null> {
       // 每 10 秒报告一次进度
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       if (elapsed - lastReportTime >= reportInterval && elapsed > 0) {
-        broadcast({ type: 'log', level: 'info', message: `  等待验证邮件中... (${elapsed}s/${actualTimeout}s, 已尝试 ${attempts} 次)` });
+        const progress = Math.min(Math.floor((elapsed / actualTimeout) * 100), 99);
+        const remaining = actualTimeout - elapsed;
+        broadcast({
+          type: 'log',
+          level: 'info',
+          message: `  等待验证邮件中... [${progress}%] 已用: ${formatTime(elapsed)} / 剩余: ${formatTime(remaining)} (已尝试 ${attempts} 次)`
+        });
         lastReportTime = elapsed;
       }
 
@@ -361,8 +447,14 @@ async function registerAccount(): Promise<boolean> {
     const email = createEmail();
     const password = createPassword();
     const name = email.split("@")[0];
+    const emailCheckUrl = `https://mail.chatgpt.org.uk/api/get-emails?email=${encodeURIComponent(email)}`;
 
-    broadcast({ type: 'log', level: 'info', message: `▶ 开始注册: ${email}` });
+    broadcast({
+      type: 'log',
+      level: 'info',
+      message: `▶ 开始注册: ${email}`,
+      link: { text: '查看邮箱', url: emailCheckUrl }
+    });
 
     // 1. 注册
     broadcast({ type: 'log', level: 'info', message: `  → 发送注册请求...` });
@@ -389,12 +481,11 @@ async function registerAccount(): Promise<boolean> {
     broadcast({ type: 'log', level: 'success', message: `  ✓ 注册请求成功` });
 
     // 2. 获取验证邮件
-    const emailCheckUrl = `https://mail.chatgpt.org.uk/api/get-emails?email=${encodeURIComponent(email)}`;
     broadcast({
       type: 'log',
       level: 'info',
-      message: `  → 等待验证邮件...`,
-      link: { text: '点击查看邮箱', url: emailCheckUrl }
+      message: `  → 等待验证邮件: ${email}`,
+      link: { text: '点击打开邮箱', url: emailCheckUrl }
     });
     const emailContent = await fetchVerificationEmail(email);
     if (!emailContent) {
@@ -405,9 +496,6 @@ async function registerAccount(): Promise<boolean> {
     // 3. 提取验证链接
     broadcast({ type: 'log', level: 'info', message: `  → 提取验证链接...` });
 
-    // 先打印邮件内容用于调试
-    broadcast({ type: 'log', level: 'info', message: `  → 邮件内容长度: ${emailContent.length} 字符` });
-
     // 尝试多种匹配方式
     let verificationUrl = null;
 
@@ -415,7 +503,6 @@ async function registerAccount(): Promise<boolean> {
     let match = emailContent.match(/https:\/\/chat\.z\.ai\/auth\/verify_email\?[^\s<>"']+/);
     if (match) {
       verificationUrl = match[0].replace(/&amp;/g, '&').replace(/&#39;/g, "'");
-      broadcast({ type: 'log', level: 'success', message: `  ✓ 找到验证链接 (新版路径)` });
     }
 
     // 方式2: 匹配 /verify_email 路径（旧版本）
@@ -457,8 +544,6 @@ async function registerAccount(): Promise<boolean> {
       return false;
     }
 
-    // 打印解析后的URL用于调试
-    broadcast({ type: 'log', level: 'info', message: `  → 解析URL: ${verificationUrl}` });
 
     const { token, email: emailFromUrl, username } = parseVerificationUrl(verificationUrl);
     if (!token || !emailFromUrl || !username) {
@@ -512,7 +597,8 @@ async function registerAccount(): Promise<boolean> {
         type: 'log',
         level: 'warning',
         message: `⚠️ 注册成功但API登录失败: ${email} (仅获取Token)`,
-        stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed }
+        stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed },
+        link: { text: '查看邮箱', url: emailCheckUrl }
       });
       broadcast({ type: 'account_added', account: { email, password, token: userToken, apikey: null, createdAt: new Date().toISOString() } });
       return true;
@@ -529,7 +615,8 @@ async function registerAccount(): Promise<boolean> {
         type: 'log',
         level: 'warning',
         message: `⚠️ 注册成功但获取组织信息失败: ${email} (仅获取Token)`,
-        stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed }
+        stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed },
+        link: { text: '查看邮箱', url: emailCheckUrl }
       });
       broadcast({ type: 'account_added', account: { email, password, token: userToken, apikey: null, createdAt: new Date().toISOString() } });
       return true;
@@ -548,7 +635,8 @@ async function registerAccount(): Promise<boolean> {
         type: 'log',
         level: 'success',
         message: `✅ 注册完成: ${email} (包含APIKEY)`,
-        stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed }
+        stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed },
+        link: { text: '查看邮箱', url: emailCheckUrl }
       });
       broadcast({ type: 'account_added', account: { email, password, token: userToken, apikey: apiKey, createdAt: new Date().toISOString() } });
     } else {
@@ -556,7 +644,8 @@ async function registerAccount(): Promise<boolean> {
         type: 'log',
         level: 'warning',
         message: `⚠️ 注册成功但创建API密钥失败: ${email} (仅获取Token)`,
-        stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed }
+        stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed },
+        link: { text: '查看邮箱', url: emailCheckUrl }
       });
       broadcast({ type: 'account_added', account: { email, password, token: userToken, apikey: null, createdAt: new Date().toISOString() } });
     }
@@ -589,7 +678,25 @@ async function batchRegister(count: number): Promise<void> {
     // 创建并发任务
     for (let i = 0; i < batchSize; i++) {
       const taskIndex = completed + i + 1;
-      broadcast({ type: 'log', level: 'info', message: `\n[${taskIndex}/${count}] ━━━━━━━━━━━━━━━━━━━━` });
+      const progress = Math.floor((taskIndex / count) * 100);
+      const elapsed = Math.floor((Date.now() - stats.startTime) / 1000);
+      const avgTimePerAccount = completed > 0 ? elapsed / completed : 0;
+      const remaining = count - taskIndex;
+      const eta = avgTimePerAccount > 0 ? Math.ceil(remaining * avgTimePerAccount) : 0;
+
+      // 格式化时间显示
+      const formatTime = (seconds: number): string => {
+        if (seconds < 60) return `${seconds}s`;
+        const mins = Math.floor(seconds / 60);
+        const secs = seconds % 60;
+        return `${mins}m${secs}s`;
+      };
+
+      broadcast({
+        type: 'log',
+        level: 'info',
+        message: `\n[${taskIndex}/${count}] ━━━━━━━━━━━━━━━━━━━━ [${progress}%] 已用: ${formatTime(elapsed)} / 预计剩余: ${formatTime(eta)}`
+      });
       batchPromises.push(registerAccount());
     }
 
@@ -710,7 +817,7 @@ const HTML_PAGE = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Z.AI 账号管理系统</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
@@ -725,24 +832,186 @@ const HTML_PAGE = `<!DOCTYPE html>
         }
         .toast-enter { animation: slideIn 0.3s ease-out; }
         .toast-exit { animation: slideOut 0.3s ease-in; }
+
+        /* 移动端优化 */
+        @media (max-width: 768px) {
+            .mobile-scroll {
+                overflow-x: auto;
+                -webkit-overflow-scrolling: touch;
+            }
+
+            table {
+                font-size: 0.75rem;
+            }
+
+            /* 移动端固定Toast位置到底部 */
+            #toastContainer {
+                left: 0.5rem;
+                right: 0.5rem;
+                top: auto;
+                bottom: 0.5rem;
+            }
+
+            /* 优化日志容器高度 */
+            #logContainer {
+                height: 10rem !important;
+            }
+
+            /* 隐藏部分列 */
+            .hide-mobile {
+                display: none;
+            }
+
+            /* 移动端按钮组优化 */
+            .btn-group-mobile {
+                flex-wrap: wrap;
+            }
+
+            /* 移动端可点击单元格 */
+            .clickable-cell {
+                cursor: pointer;
+            }
+
+            .clickable-cell:active {
+                opacity: 0.5;
+            }
+        }
+
+        /* 触摸优化 */
+        button, a, input[type="checkbox"] {
+            -webkit-tap-highlight-color: rgba(0, 0, 0, 0.1);
+        }
+
+        /* 防止双击缩放 */
+        * {
+            touch-action: manipulation;
+        }
+
+        /* PC端优化 */
+        @media (min-width: 769px) {
+            /* 表格悬停效果 */
+            tbody tr {
+                transition: all 0.2s ease;
+            }
+
+            tbody tr:hover {
+                background-color: #f8fafc;
+                transform: translateX(4px);
+                box-shadow: -4px 0 0 0 #6366f1;
+            }
+
+            /* 操作按钮悬停效果 */
+            .action-btn {
+                transition: all 0.15s ease;
+                position: relative;
+            }
+
+            .action-btn:hover {
+                transform: translateY(-1px);
+            }
+
+            .action-btn::after {
+                content: '';
+                position: absolute;
+                bottom: -2px;
+                left: 0;
+                right: 0;
+                height: 2px;
+                background: currentColor;
+                transform: scaleX(0);
+                transition: transform 0.2s ease;
+            }
+
+            .action-btn:hover::after {
+                transform: scaleX(1);
+            }
+
+            /* 表格单元格内边距优化 */
+            td, th {
+                padding: 1rem !important;
+            }
+
+            /* 代码块样式优化 */
+            code {
+                font-family: 'Courier New', Consolas, Monaco, monospace;
+                letter-spacing: -0.5px;
+            }
+
+            /* 可点击单元格样式 */
+            .clickable-cell {
+                cursor: pointer;
+                transition: all 0.15s ease;
+                position: relative;
+            }
+
+            .clickable-cell:hover {
+                opacity: 0.7;
+            }
+
+            .clickable-cell::before {
+                content: '📋';
+                position: absolute;
+                left: 0;
+                top: 50%;
+                transform: translateY(-50%);
+                opacity: 0;
+                transition: opacity 0.2s ease;
+                font-size: 0.75rem;
+            }
+
+            .clickable-cell:hover::before {
+                opacity: 0.5;
+            }
+        }
+
+        /* 滚动条美化 */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #f1f5f9;
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #94a3b8;
+        }
+
+        /* 日志链接样式优化 */
+        #logContainer a {
+            text-decoration: none;
+            transition: all 0.2s ease;
+        }
+
+        #logContainer a:hover {
+            opacity: 0.8;
+            transform: translateX(2px);
+        }
     </style>
 </head>
-<body class="bg-gradient-to-br from-indigo-500 via-purple-500 to-pink-500 min-h-screen p-4 md:p-8">
+<body class="bg-gradient-to-br from-indigo-500 via-purple-500 to-pink-500 min-h-screen p-2 sm:p-4 md:p-8">
     <!-- Toast 容器 -->
     <div id="toastContainer" class="fixed top-4 right-4 z-50 space-y-2"></div>
 
     <div class="max-w-7xl mx-auto">
-        <div class="text-center text-white mb-8">
-            <div class="flex items-center justify-between">
-                <div class="flex-1"></div>
+        <div class="text-center text-white mb-4 sm:mb-8">
+            <div class="flex flex-col sm:flex-row items-center justify-between gap-4">
+                <div class="hidden sm:block flex-1"></div>
                 <div class="flex-1 text-center">
-                    <h1 class="text-4xl md:text-5xl font-bold mb-3">🤖 Z.AI 账号管理系统 V2</h1>
-                    <p class="text-lg md:text-xl opacity-90">批量注册 · 数据管理 · 实时监控 · 高级设置</p>
-          <p class="text-sm mt-2 opacity-80">📦 <a href="https://github.com/dext7r/ZtoApi/tree/main/deno/zai/zai_register.ts" target="_blank" class="text-cyan-200 underline">源码地址 (GitHub)</a> |
-          💬 <a href="https://linux.do/t/topic/1009939" target="_blank" class="text-cyan-200 underline">交流讨论</a></p>
+                    <h1 class="text-2xl sm:text-3xl md:text-5xl font-bold mb-2">🤖 Z.AI 管理系统 V2</h1>
+                    <p class="text-sm sm:text-base md:text-xl opacity-90">批量注册 · 数据管理 · 实时监控</p>
+          <p class="text-xs sm:text-sm mt-2 opacity-80">📦 <a href="https://github.com/dext7r/ZtoApi/tree/main/deno/zai/zai_register.ts" target="_blank" class="text-cyan-200 underline">源码</a> |
+          💬 <a href="https://linux.do/t/topic/1009939" target="_blank" class="text-cyan-200 underline">讨论</a></p>
                 </div>
-                <div class="flex-1 flex justify-end">
-                    <button id="logoutBtn" class="px-4 py-2 bg-white/20 hover:bg-white/30 rounded-lg text-white font-semibold transition">
+                <div class="w-full sm:w-auto sm:flex-1 sm:flex sm:justify-end">
+                    <button id="logoutBtn" class="w-full sm:w-auto px-4 py-2 bg-white/20 hover:bg-white/30 rounded-lg text-white font-semibold transition">
                         退出登录
                     </button>
                 </div>
@@ -750,14 +1019,14 @@ const HTML_PAGE = `<!DOCTYPE html>
         </div>
 
         <!-- 控制面板 + 高级设置 -->
-        <div class="bg-white rounded-2xl shadow-2xl p-6 mb-6">
-            <div class="flex items-center justify-between mb-6">
-                <h2 class="text-2xl font-bold text-gray-800">注册控制</h2>
-                <div class="flex gap-2">
-                    <button id="settingsBtn" class="px-4 py-2 bg-gray-100 hover:bg-gray-200 rounded-lg font-semibold transition">
+        <div class="bg-white rounded-2xl shadow-2xl p-3 sm:p-6 mb-4 sm:mb-6">
+            <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 sm:gap-0 mb-4 sm:mb-6">
+                <h2 class="text-xl sm:text-2xl font-bold text-gray-800">注册控制</h2>
+                <div class="flex gap-2 w-full sm:w-auto">
+                    <button id="settingsBtn" class="flex-1 sm:flex-none px-3 sm:px-4 py-2 bg-gray-100 hover:bg-gray-200 rounded-lg font-semibold transition text-sm sm:text-base">
                         ⚙️ 高级设置
                     </button>
-                    <span id="statusBadge" class="px-4 py-2 rounded-full text-sm font-semibold bg-gray-400 text-white">闲置中</span>
+                    <span id="statusBadge" class="flex-1 sm:flex-none px-3 sm:px-4 py-2 rounded-full text-xs sm:text-sm font-semibold bg-gray-400 text-white text-center">闲置中</span>
                 </div>
             </div>
 
@@ -812,15 +1081,15 @@ const HTML_PAGE = `<!DOCTYPE html>
                 </div>
             </div>
 
-            <div class="flex gap-4 mb-4">
+            <div class="flex flex-col sm:flex-row gap-3 sm:gap-4 mb-4">
                 <input type="number" id="registerCount" value="5" min="1" max="100"
-                    class="flex-1 px-4 py-3 border-2 border-gray-200 rounded-lg focus:border-indigo-500 focus:ring focus:ring-indigo-200 transition">
+                    class="flex-1 px-4 py-3 text-base border-2 border-gray-200 rounded-lg focus:border-indigo-500 focus:ring focus:ring-indigo-200 transition">
                 <button id="startRegisterBtn"
-                    class="px-8 py-3 bg-gradient-to-r from-indigo-500 to-purple-600 text-white font-semibold rounded-lg shadow-lg hover:shadow-xl hover:-translate-y-0.5 transition-all disabled:opacity-60 disabled:cursor-not-allowed">
+                    class="w-full sm:w-auto px-6 sm:px-8 py-3 bg-gradient-to-r from-indigo-500 to-purple-600 text-white font-semibold rounded-lg shadow-lg hover:shadow-xl hover:-translate-y-0.5 transition-all disabled:opacity-60 disabled:cursor-not-allowed text-base">
                     开始注册
                 </button>
                 <button id="stopRegisterBtn" style="display: none;"
-                    class="px-8 py-3 bg-gradient-to-r from-red-500 to-pink-600 text-white font-semibold rounded-lg shadow-lg hover:shadow-xl hover:-translate-y-0.5 transition-all">
+                    class="w-full sm:w-auto px-6 sm:px-8 py-3 bg-gradient-to-r from-red-500 to-pink-600 text-white font-semibold rounded-lg shadow-lg hover:shadow-xl hover:-translate-y-0.5 transition-all text-base">
                     停止注册
                 </button>
             </div>
@@ -844,61 +1113,61 @@ const HTML_PAGE = `<!DOCTYPE html>
         </div>
 
         <!-- 统计面板 -->
-        <div class="bg-white rounded-2xl shadow-2xl p-6 mb-6">
-            <h2 class="text-2xl font-bold text-gray-800 mb-4">统计信息</h2>
-            <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-                <div class="bg-gradient-to-br from-green-400 to-emerald-500 rounded-xl p-4 text-center text-white">
-                    <div class="text-sm opacity-90 mb-1">总账号</div>
-                    <div class="text-3xl font-bold" id="totalAccounts">0</div>
+        <div class="bg-white rounded-2xl shadow-2xl p-3 sm:p-6 mb-4 sm:mb-6">
+            <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-3 sm:mb-4">统计信息</h2>
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-2 sm:gap-4">
+                <div class="bg-gradient-to-br from-green-400 to-emerald-500 rounded-xl p-3 sm:p-4 text-center text-white">
+                    <div class="text-xs sm:text-sm opacity-90 mb-1">总账号</div>
+                    <div class="text-2xl sm:text-3xl font-bold" id="totalAccounts">0</div>
                 </div>
-                <div class="bg-gradient-to-br from-blue-400 to-indigo-500 rounded-xl p-4 text-center text-white">
-                    <div class="text-sm opacity-90 mb-1">本次成功</div>
-                    <div class="text-3xl font-bold" id="successCount">0</div>
+                <div class="bg-gradient-to-br from-blue-400 to-indigo-500 rounded-xl p-3 sm:p-4 text-center text-white">
+                    <div class="text-xs sm:text-sm opacity-90 mb-1">本次成功</div>
+                    <div class="text-2xl sm:text-3xl font-bold" id="successCount">0</div>
                 </div>
-                <div class="bg-gradient-to-br from-red-400 to-pink-500 rounded-xl p-4 text-center text-white">
-                    <div class="text-sm opacity-90 mb-1">本次失败</div>
-                    <div class="text-3xl font-bold" id="failedCount">0</div>
+                <div class="bg-gradient-to-br from-red-400 to-pink-500 rounded-xl p-3 sm:p-4 text-center text-white">
+                    <div class="text-xs sm:text-sm opacity-90 mb-1">本次失败</div>
+                    <div class="text-2xl sm:text-3xl font-bold" id="failedCount">0</div>
                 </div>
-                <div class="bg-gradient-to-br from-purple-400 to-fuchsia-500 rounded-xl p-4 text-center text-white">
-                    <div class="text-sm opacity-90 mb-1">耗时</div>
-                    <div class="text-3xl font-bold" id="timeValue">0s</div>
+                <div class="bg-gradient-to-br from-purple-400 to-fuchsia-500 rounded-xl p-3 sm:p-4 text-center text-white">
+                    <div class="text-xs sm:text-sm opacity-90 mb-1">耗时</div>
+                    <div class="text-2xl sm:text-3xl font-bold" id="timeValue">0s</div>
                 </div>
             </div>
         </div>
 
         <!-- 账号列表 -->
-        <div class="bg-white rounded-2xl shadow-2xl p-6 mb-6">
-            <div class="flex items-center justify-between mb-4">
-                <h2 class="text-2xl font-bold text-gray-800">账号列表</h2>
-                <div class="flex gap-2">
+        <div class="bg-white rounded-2xl shadow-2xl p-3 sm:p-6 mb-4 sm:mb-6">
+            <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 mb-4">
+                <h2 class="text-xl sm:text-2xl font-bold text-gray-800">账号列表</h2>
+                <div class="flex flex-wrap gap-2 w-full sm:w-auto">
                     <input type="text" id="searchInput" placeholder="搜索邮箱..."
-                        class="px-4 py-2 border-2 border-gray-200 rounded-lg focus:border-indigo-500 focus:ring focus:ring-indigo-200 transition">
+                        class="flex-1 sm:flex-none px-3 sm:px-4 py-2 text-sm sm:text-base border-2 border-gray-200 rounded-lg focus:border-indigo-500 focus:ring focus:ring-indigo-200 transition">
                     <input type="file" id="importFileInput" accept=".txt" style="display: none;">
                     <button id="importBtn"
-                        class="px-6 py-2 bg-gradient-to-r from-purple-500 to-violet-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition">
-                        导入 TXT
+                        class="flex-1 sm:flex-none px-3 sm:px-6 py-2 bg-gradient-to-r from-purple-500 to-violet-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-sm sm:text-base whitespace-nowrap">
+                        导入
                     </button>
                     <button id="exportBtn"
-                        class="px-6 py-2 bg-gradient-to-r from-green-500 to-emerald-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition">
-                        导出 TXT
+                        class="flex-1 sm:flex-none px-3 sm:px-6 py-2 bg-gradient-to-r from-green-500 to-emerald-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-sm sm:text-base whitespace-nowrap">
+                        导出
                     </button>
                     <button id="refreshBtn"
-                        class="px-6 py-2 bg-gradient-to-r from-blue-500 to-indigo-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition">
+                        class="flex-1 sm:flex-none px-3 sm:px-6 py-2 bg-gradient-to-r from-blue-500 to-indigo-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-sm sm:text-base whitespace-nowrap">
                         刷新
                     </button>
                 </div>
             </div>
-            <div class="overflow-x-auto">
-                <table class="w-full">
+            <div class="overflow-x-auto mobile-scroll">
+                <table class="w-full min-w-[640px]">
                     <thead>
                         <tr class="bg-gray-50 text-left">
-                            <th class="px-4 py-3 text-sm font-semibold text-gray-700">序号</th>
-                            <th class="px-4 py-3 text-sm font-semibold text-gray-700">邮箱</th>
-                            <th class="px-4 py-3 text-sm font-semibold text-gray-700">密码</th>
-                            <th class="px-4 py-3 text-sm font-semibold text-gray-700">Token</th>
-                            <th class="px-4 py-3 text-sm font-semibold text-gray-700">APIKEY</th>
-                            <th class="px-4 py-3 text-sm font-semibold text-gray-700">创建时间</th>
-                            <th class="px-4 py-3 text-sm font-semibold text-gray-700">操作</th>
+                            <th class="px-2 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm font-semibold text-gray-700">序号</th>
+                            <th class="px-2 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm font-semibold text-gray-700">邮箱</th>
+                            <th class="px-2 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm font-semibold text-gray-700 hide-mobile">密码</th>
+                            <th class="px-2 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm font-semibold text-gray-700 hide-mobile">Token</th>
+                            <th class="px-2 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm font-semibold text-gray-700 hide-mobile">APIKEY</th>
+                            <th class="px-2 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm font-semibold text-gray-700 hide-mobile">创建时间</th>
+                            <th class="px-2 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm font-semibold text-gray-700">操作</th>
                         </tr>
                     </thead>
                     <tbody id="accountTableBody" class="divide-y divide-gray-200">
@@ -909,17 +1178,19 @@ const HTML_PAGE = `<!DOCTYPE html>
                 </table>
             </div>
             <!-- 分页控件 -->
-            <div class="flex items-center justify-between mt-4 px-4">
-                <div class="text-sm text-gray-600">
+            <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 mt-4 px-2 sm:px-4">
+                <div class="text-xs sm:text-sm text-gray-600">
                     共 <span id="totalItems">0</span> 条数据
                 </div>
-                <div class="flex items-center gap-2">
-                    <button id="firstPageBtn" class="px-3 py-1 border border-gray-300 rounded hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed">首页</button>
-                    <button id="prevPageBtn" class="px-3 py-1 border border-gray-300 rounded hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed">上一页</button>
-                    <div class="flex items-center gap-1" id="pageNumbers"></div>
-                    <button id="nextPageBtn" class="px-3 py-1 border border-gray-300 rounded hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed">下一页</button>
-                    <button id="lastPageBtn" class="px-3 py-1 border border-gray-300 rounded hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed">尾页</button>
-                    <select id="pageSizeSelect" class="ml-2 px-2 py-1 border border-gray-300 rounded">
+                <div class="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 w-full sm:w-auto">
+                    <div class="flex items-center gap-1 sm:gap-2 overflow-x-auto">
+                        <button id="firstPageBtn" class="px-2 sm:px-3 py-1 text-xs sm:text-sm border border-gray-300 rounded hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap">首页</button>
+                        <button id="prevPageBtn" class="px-2 sm:px-3 py-1 text-xs sm:text-sm border border-gray-300 rounded hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap">上一页</button>
+                        <div class="flex items-center gap-1" id="pageNumbers"></div>
+                        <button id="nextPageBtn" class="px-2 sm:px-3 py-1 text-xs sm:text-sm border border-gray-300 rounded hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap">下一页</button>
+                    <button id="lastPageBtn" class="px-2 sm:px-3 py-1 text-xs sm:text-sm border border-gray-300 rounded hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap">尾页</button>
+                    </div>
+                    <select id="pageSizeSelect" class="px-2 py-1 text-xs sm:text-sm border border-gray-300 rounded w-full sm:w-auto">
                         <option value="10">10条/页</option>
                         <option value="20" selected>20条/页</option>
                         <option value="50">50条/页</option>
@@ -930,15 +1201,15 @@ const HTML_PAGE = `<!DOCTYPE html>
         </div>
 
         <!-- 实时日志 -->
-        <div class="bg-white rounded-2xl shadow-2xl p-6">
-            <div class="flex items-center justify-between mb-4">
-                <h2 class="text-2xl font-bold text-gray-800">实时日志</h2>
+        <div class="bg-white rounded-2xl shadow-2xl p-3 sm:p-6">
+            <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 mb-4">
+                <h2 class="text-xl sm:text-2xl font-bold text-gray-800">实时日志</h2>
                 <button id="clearLogBtn"
-                    class="px-4 py-2 bg-gradient-to-r from-gray-500 to-gray-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition">
+                    class="w-full sm:w-auto px-3 sm:px-4 py-2 bg-gradient-to-r from-gray-500 to-gray-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-sm sm:text-base">
                     清空日志
                 </button>
             </div>
-            <div id="logContainer" class="bg-gray-900 rounded-lg p-4 h-64 overflow-y-auto font-mono text-sm">
+            <div id="logContainer" class="bg-gray-900 rounded-lg p-3 sm:p-4 h-40 sm:h-64 overflow-y-auto font-mono text-xs sm:text-sm">
                 <div class="text-blue-400">等待任务启动...</div>
             </div>
         </div>
@@ -1034,9 +1305,12 @@ const HTML_PAGE = `<!DOCTYPE html>
 
             let html = '<span class="text-gray-500">[' + time + ']</span> ' + message;
 
-            // 添加链接
+            // 添加链接（优化样式，更醒目）
             if (link && link.url) {
-                html += ' <a href="' + link.url + '" target="_blank" class="text-cyan-400 hover:text-cyan-300 underline">[' + (link.text || '查看') + ']</a>';
+                html += ' <a href="' + link.url + '" target="_blank" class="inline-flex items-center ml-2 px-2 py-0.5 bg-cyan-600/20 text-cyan-400 hover:text-cyan-300 hover:bg-cyan-600/30 rounded border border-cyan-500/30 text-xs font-medium transition">' +
+                    '<svg class="w-3 h-3 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>' +
+                    (link.text || '查看') +
+                    '</a>';
             }
 
             const $log = $('<div>', {
@@ -1075,43 +1349,57 @@ const HTML_PAGE = `<!DOCTYPE html>
                     const rowId = 'row-' + (startIndex + idx);
                     // 处理APIKEY显示
                     const apikeyDisplay = acc.apikey ?
-                        '<code class="bg-gray-100 px-2 py-1 rounded text-xs">' + acc.apikey.substring(0, 20) + '...</code>' :
-                        '<span class="text-gray-400 text-xs">未生成</span>';
+                        '<code class="bg-indigo-50 text-indigo-700 px-2 py-1 rounded text-xs font-mono">' + acc.apikey.substring(0, 20) + '...</code>' :
+                        '<span class="text-gray-400 text-xs italic">未生成</span>';
 
-                    return '<tr class="hover:bg-gray-50" id="' + rowId + '">' +
-                        '<td class="px-4 py-3 text-sm text-gray-700">' + (startIndex + idx + 1) + '</td>' +
-                        '<td class="px-4 py-3 text-sm text-gray-700">' + acc.email + '</td>' +
-                        '<td class="px-4 py-3 text-sm text-gray-700"><code class="bg-gray-100 px-2 py-1 rounded">' + acc.password + '</code></td>' +
-                        '<td class="px-4 py-3 text-sm text-gray-700"><code class="bg-gray-100 px-2 py-1 rounded text-xs">' + acc.token.substring(0, 20) + '...</code></td>' +
-                        '<td class="px-4 py-3 text-sm text-gray-700">' + apikeyDisplay + '</td>' +
-                        '<td class="px-4 py-3 text-sm text-gray-700">' + new Date(acc.createdAt).toLocaleString('zh-CN') + '</td>' +
-                        '<td class="px-4 py-3 flex gap-2">' +
-                            '<button class="copy-account-btn text-blue-600 hover:text-blue-800 text-sm font-medium" data-email="' + acc.email + '" data-password="' + acc.password + '">复制账号</button>' +
-                            '<button class="copy-token-btn text-green-600 hover:text-green-800 text-sm font-medium" data-token="' + acc.token + '">复制Token</button>' +
-                            (acc.apikey ? '<button class="copy-apikey-btn text-purple-600 hover:text-purple-800 text-sm font-medium" data-apikey="' + acc.apikey + '">复制APIKEY</button>' : '') +
-                        '</td>' +
+                    return '<tr class="group" id="' + rowId + '">' +
+                        '<td class="px-2 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm text-gray-700 font-medium">' + (startIndex + idx + 1) + '</td>' +
+                        '<td class="px-2 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm text-gray-700 truncate max-w-[200px] clickable-cell" title="点击复制: ' + acc.email + '" data-copy="' + acc.email + '">' + acc.email + '</td>' +
+                        '<td class="px-2 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm text-gray-700 hide-mobile clickable-cell" title="点击复制密码" data-copy="' + acc.password + '"><code class="bg-blue-50 text-blue-700 px-2 py-1 rounded text-xs font-mono">' + acc.password + '</code></td>' +
+                        '<td class="px-2 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm text-gray-700 hide-mobile clickable-cell" title="点击复制Token" data-copy="' + acc.token + '"><code class="bg-green-50 text-green-700 px-2 py-1 rounded text-xs font-mono">' + acc.token.substring(0, 20) + '...</code></td>' +
+                        '<td class="px-2 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm text-gray-700 hide-mobile' + (acc.apikey ? ' clickable-cell' : '') + '"' + (acc.apikey ? ' title="点击复制APIKEY" data-copy="' + acc.apikey + '"' : '') + '>' + apikeyDisplay + '</td>' +
+                        '<td class="px-2 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm text-gray-700 hide-mobile">' + new Date(acc.createdAt).toLocaleString('zh-CN') + '</td>' +
+                        '<td class="px-2 sm:px-4 py-2 sm:py-3"><div class="flex gap-1 sm:gap-2 flex-wrap">' +
+                            '<button class="copy-full-btn action-btn text-indigo-600 hover:text-indigo-800 text-xs sm:text-sm font-medium whitespace-nowrap" ' +
+                            'data-email="' + acc.email + '" ' +
+                            'data-password="' + acc.password + '" ' +
+                            'data-token="' + acc.token + '" ' +
+                            'data-apikey="' + (acc.apikey || '') + '" ' +
+                            'data-createdat="' + acc.createdAt + '">复制全部</button>' +
+                        '</div></td>' +
                     '</tr>';
                 });
                 $accountTableBody.html(rows.join(''));
 
-                // 绑定事件
-                $('.copy-account-btn').on('click', function() {
+                // 绑定单元格点击复制事件
+                $('.clickable-cell').on('click', function() {
+                    const copyText = $(this).data('copy');
+                    if (copyText) {
+                        navigator.clipboard.writeText(copyText);
+                        const cellContent = $(this).text().trim();
+                        const displayText = cellContent.length > 30 ? cellContent.substring(0, 30) + '...' : cellContent;
+                        showToast('已复制: ' + displayText, 'success');
+                    }
+                });
+
+                // 绑定"复制全部"按钮事件
+                $('.copy-full-btn').on('click', function() {
                     const email = $(this).data('email');
                     const password = $(this).data('password');
-                    navigator.clipboard.writeText(email + '----' + password);
-                    showToast('已复制账号: ' + email, 'success');
-                });
-
-                $('.copy-token-btn').on('click', function() {
                     const token = $(this).data('token');
-                    navigator.clipboard.writeText(token);
-                    showToast('已复制 Token', 'success');
-                });
-
-                $('.copy-apikey-btn').on('click', function() {
                     const apikey = $(this).data('apikey');
-                    navigator.clipboard.writeText(apikey);
-                    showToast('已复制 APIKEY', 'success');
+                    const createdAt = $(this).data('createdat');
+
+                    // 构建完整的账号信息
+                    let fullInfo = '邮箱: ' + email + '\\n密码: ' + password + '\\n';
+                    fullInfo += 'Token: ' + token + '\\n';
+                    if (apikey) {
+                        fullInfo += 'APIKEY: ' + apikey + '\\n';
+                    }
+                    fullInfo += '创建时间: ' + new Date(createdAt).toLocaleString('zh-CN');
+
+                    navigator.clipboard.writeText(fullInfo);
+                    showToast('已复制完整账号信息', 'success');
                 });
             }
 
@@ -1366,21 +1654,34 @@ const HTML_PAGE = `<!DOCTYPE html>
                     body: JSON.stringify({ count })
                 });
 
+                const result = await response.json();
+
                 if (!response.ok) {
                     if (response.status === 302) {
                         window.location.href = '/login';
                         return;
                     }
-                    throw new Error('HTTP ' + response.status);
+
+                    // 显示详细错误信息
+                    if (result.isRunning) {
+                        const msg = result.error + '\\n\\n' +
+                            '当前进度：' + result.stats.success + ' 成功 / ' + result.stats.failed + ' 失败 / ' + result.stats.total + ' 已完成';
+                        showToast(msg, 'warning');
+                        addLog('⚠️ ' + result.error, 'warning');
+                    } else {
+                        showToast(result.error || '启动失败', 'error');
+                        addLog('✗ ' + (result.error || '启动失败'), 'error');
+                    }
+                    return;
                 }
 
-                const result = await response.json();
                 if (!result.success) {
                     addLog('✗ ' + (result.error || '启动失败'), 'error');
                 }
             } catch (error) {
                 console.error('启动注册失败:', error);
                 addLog('✗ 启动失败: ' + error.message, 'error');
+                showToast('启动失败: ' + error.message, 'error');
             }
         });
 
@@ -1540,8 +1841,17 @@ async function handler(req: Request): Promise<Response> {
     const stream = new ReadableStream({
       start(controller) {
         sseClients.add(controller);
+        // 发送当前状态
         const message = `data: ${JSON.stringify({ type: 'connected', isRunning })}\n\n`;
         controller.enqueue(new TextEncoder().encode(message));
+
+        // 发送历史日志（最近50条）
+        const recentLogs = logHistory.slice(-50);
+        for (const log of recentLogs) {
+          const logMessage = `data: ${JSON.stringify(log)}\n\n`;
+          controller.enqueue(new TextEncoder().encode(logMessage));
+        }
+
         const keepAlive = setInterval(() => {
           try {
             controller.enqueue(new TextEncoder().encode(": keepalive\n\n"));
@@ -1555,6 +1865,17 @@ async function handler(req: Request): Promise<Response> {
 
     return new Response(stream, {
       headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" }
+    });
+  }
+
+  // 获取运行状态（新增 API）
+  if (url.pathname === "/api/status") {
+    return new Response(JSON.stringify({
+      isRunning,
+      stats,
+      logCount: logHistory.length
+    }), {
+      headers: { "Content-Type": "application/json" }
     });
   }
 
@@ -1695,7 +2016,16 @@ async function handler(req: Request): Promise<Response> {
   // 开始注册
   if (url.pathname === "/api/register" && req.method === "POST") {
     if (isRunning) {
-      return new Response(JSON.stringify({ error: "任务正在运行中" }), {
+      return new Response(JSON.stringify({
+        success: false,
+        error: "任务正在运行中，请等待当前任务完成或手动停止后再试",
+        isRunning: true,
+        stats: {
+          success: stats.success,
+          failed: stats.failed,
+          total: stats.success + stats.failed
+        }
+      }), {
         status: 400,
         headers: { "Content-Type": "application/json" }
       });
@@ -1723,13 +2053,23 @@ async function handler(req: Request): Promise<Response> {
   return new Response("Not Found", { status: 404 });
 }
 
-// 启动时从 KV 加载配置
+// 启动时从 KV 加载配置和日志
 (async () => {
+  // 加载配置
   const configKey = ["config", "register"];
   const savedConfig = await kv.get(configKey);
   if (savedConfig.value) {
     registerConfig = { ...registerConfig, ...savedConfig.value };
     console.log("✓ 已加载保存的配置");
+  }
+
+  // 清理历史日志（重启时清空）
+  const logKey = ["logs", "recent"];
+  try {
+    await kv.delete(logKey);
+    console.log("✓ 已清理历史日志数据");
+  } catch (error) {
+    console.log("⚠️ 清理日志失败:", error);
   }
 })();
 
