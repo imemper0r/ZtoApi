@@ -1734,7 +1734,9 @@ const HTML_PAGE = `<!DOCTYPE html>
             filteredAccounts = accounts;
             $totalAccounts.text(accounts.length);
             currentPage = 1;
-            renderTable();
+
+            // 加载并合并本地账号
+            await loadLocalAccounts();
         }
 
         $searchInput.on('input', function() {
@@ -2033,7 +2035,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                 request.onsuccess = () => {
                     db = request.result;
                     console.log('✓ IndexedDB初始化成功');
-                    loadLocalAccounts(); // 加载本地账号到界面
+                    // loadAccounts() 会调用 loadLocalAccounts() 合并本地账号
                     resolve(db);
                 };
 
@@ -2110,10 +2112,40 @@ const HTML_PAGE = `<!DOCTYPE html>
                 const localAccounts = await getAllLocalAccounts();
                 console.log(\`✓ 加载了 \${localAccounts.length} 个本地账号\`);
 
-                // 合并显示（服务端账号 + 本地账号）
-                // 服务端账号已经在 loadAccounts() 中加载
-                // 这里只需要更新统计信息
-                $('#localAccountsCount').text(localAccounts.filter(a => a.source === 'local').length);
+                // 合并服务端账号和本地账号到accounts数组
+                // 使用Map去重（以email为key）
+                const accountMap = new Map();
+
+                // 先添加服务器账号
+                accounts.forEach(acc => {
+                    accountMap.set(acc.email, acc);
+                });
+
+                // 再添加本地账号（如果email不存在）
+                localAccounts.forEach(acc => {
+                    if (!accountMap.has(acc.email)) {
+                        // 格式化为统一的账号格式
+                        accountMap.set(acc.email, {
+                            email: acc.email,
+                            password: acc.password,
+                            token: acc.token,
+                            apikey: acc.apikey || null,
+                            source: acc.source || 'local',
+                            createdAt: acc.createdAt
+                        });
+                    }
+                });
+
+                // 更新accounts和filteredAccounts
+                accounts = Array.from(accountMap.values());
+                filteredAccounts = accounts;
+
+                // 更新统计
+                $totalAccounts.text(accounts.length);
+                $('#localAccountsCount').text(accounts.filter(a => a.source === 'local').length);
+
+                // 重新渲染表格（保持当前过滤模式）
+                renderTable();
             } catch (error) {
                 console.error('加载本地账号失败:', error);
             }
