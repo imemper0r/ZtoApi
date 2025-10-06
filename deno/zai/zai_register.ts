@@ -54,8 +54,22 @@ const DOMAINS = [
 
 // ==================== 数据存储 ====================
 
-// Deno KV 数据库实例
-const kv = await Deno.openKv();
+// Deno KV 数据库实例（初始化后保证非 null）
+let kv: Deno.Kv;
+
+// 初始化 KV 数据库
+async function initKV() {
+  try {
+    kv = await Deno.openKv();
+    console.log("[DEBUG] Deno KV database initialized");
+  } catch (error) {
+    console.error("❌ Failed to initialize Deno KV:", error);
+    console.error("⚠️  CRITICAL: Registration and account management will NOT work!");
+    console.error("   Please ensure Deno has --unstable-kv flag enabled.");
+    console.error("   Run with: deno run --allow-net --allow-env --allow-read --unstable-kv zai_register.ts");
+    throw new Error("Deno KV initialization failed. Cannot continue without KV storage.");
+  }
+}
 
 // ==================== 全局状态 ====================
 
@@ -2263,6 +2277,9 @@ async function handler(req: Request): Promise<Response> {
 
   return new Response("Not Found", { status: 404 });
 }
+
+// Initialize KV database before loading config
+await initKV();
 
 // 启动时从 KV 加载配置和日志
 (async () => {

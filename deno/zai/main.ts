@@ -237,7 +237,7 @@ async function getTokenFromKVPool(): Promise<string | null> {
 }
 
 // Initialize Deno KV database (for local storage)
-let kv: Deno.Kv;
+let kv: Deno.Kv | null = null;
 
 // Initialize database connection
 async function initDB() {
@@ -245,7 +245,9 @@ async function initDB() {
     kv = await Deno.openKv();
     debugLog("Deno KV database initialized");
   } catch (error) {
-    console.error("Failed to initialize Deno KV:", error);
+    console.error("❌ Failed to initialize Deno KV:", error);
+    console.error("⚠️  WARNING: Admin features and account management will NOT work!");
+    console.error("   Please ensure Deno has --unstable-kv flag enabled.");
   }
 }
 
@@ -290,17 +292,26 @@ async function checkAuth(req: Request): Promise<{ authenticated: boolean; sessio
  * Save account to KV database
  */
 async function saveAccountToKV(email: string, password: string, token: string, apikey?: string): Promise<void> {
-  if (!kv) return;
+  if (!kv) {
+    console.warn("⚠️  Cannot save account: KV database not available");
+    return;
+  }
 
-  const timestamp = Date.now();
-  const key = ["zai_accounts", timestamp, email];
-  await kv.set(key, {
-    email,
-    password,
-    token,
-    apikey: apikey || null,  // 支持 APIKEY 字段
-    createdAt: new Date().toISOString()
-  });
+  try {
+    const timestamp = Date.now();
+    const key = ["zai_accounts", timestamp, email];
+    await kv.set(key, {
+      email,
+      password,
+      token,
+      apikey: apikey || null,  // 支持 APIKEY 字段
+      createdAt: new Date().toISOString()
+    });
+    debugLog(`Account saved: ${email}`);
+  } catch (error) {
+    console.error("❌ Failed to save account to KV:", error);
+    throw error; // Re-throw to let caller handle it
+  }
 }
 
 /**
@@ -3983,11 +3994,33 @@ async function handler(req: Request): Promise<Response> {
     // Admin login API (no auth required)
     if (path === "/admin/api/login" && req.method === "POST") {
       try {
+        if (!kv) {
+          return new Response(JSON.stringify({
+            success: false,
+            error: "管理功能不可用: KV 数据库未初始化"
+          }), {
+            status: 503,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+
         const body = await req.json();
         if (body.username === ADMIN_USERNAME && body.password === ADMIN_PASSWORD) {
           const sessionId = generateSessionId();
           const sessionKey = ["admin_sessions", sessionId];
-          await kv.set(sessionKey, { createdAt: Date.now() }, { expireIn: 86400000 }); // 24 hours
+
+          try {
+            await kv.set(sessionKey, { createdAt: Date.now() }, { expireIn: 86400000 }); // 24 hours
+          } catch (error) {
+            console.error("❌ Failed to save session to KV:", error);
+            return new Response(JSON.stringify({
+              success: false,
+              error: "登录失败: 无法保存会话"
+            }), {
+              status: 500,
+              headers: { "Content-Type": "application/json" }
+            });
+          }
 
           return new Response(JSON.stringify({ success: true, sessionId }), {
             headers: { "Content-Type": "application/json" }
@@ -3997,8 +4030,12 @@ async function handler(req: Request): Promise<Response> {
           status: 401,
           headers: { "Content-Type": "application/json" }
         });
-      } catch (error) {
-        return new Response(JSON.stringify({ success: false, error: "请求错误" }), {
+      } catch (error: unknown) {
+        const errorMessage = error instanceof Error ? error.message : '未知错误';
+        return new Response(JSON.stringify({
+          success: false,
+          error: `请求错误: ${errorMessage}`,
+        }), {
           status: 400,
           headers: { "Content-Type": "application/json" }
         });
@@ -4163,6 +4200,15 @@ if (ADMIN_ENABLED) {
 // Initialize database and KV token pool
 await initDB();
 await initKVTokenPool();
+
+// Check KV availability and warn if not available
+if (ADMIN_ENABLED && !kv) {
+  console.warn("⚠️  WARNING: Deno KV is not available!");
+  console.warn("   - Admin panel login will NOT work");
+  console.warn("   - Account management will NOT work");
+  console.warn("   - Playground will NOT be accessible");
+  console.warn("   Please run with: deno run --allow-net --allow-env --allow-read --unstable-kv main.ts");
+}
 
 // Schedule daily stats aggregation and cleanup (runs every hour)
 setInterval(async () => {
