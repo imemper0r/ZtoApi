@@ -1,5 +1,7 @@
 // Deno OpenAI-Compatible API Proxy for Z.ai GLM-4.5
 
+/// <reference lib="deno.unstable" />
+
 // Make this file a module to support top-level await
 export {};
 
@@ -14,6 +16,11 @@ const DEBUG_MODE = Deno.env.get("DEBUG_MODE") === "true" || true;
 const DEFAULT_STREAM = Deno.env.get("DEFAULT_STREAM") !== "false";
 const DASHBOARD_ENABLED = Deno.env.get("DASHBOARD_ENABLED") !== "false";
 const ENABLE_THINKING = Deno.env.get("ENABLE_THINKING") === "true";
+
+// Admin authentication configuration
+const ADMIN_USERNAME = Deno.env.get("ADMIN_USERNAME") || "admin";
+const ADMIN_PASSWORD = Deno.env.get("ADMIN_PASSWORD") || "123456";
+const ADMIN_ENABLED = Deno.env.get("ADMIN_ENABLED") !== "false";
 
 // Browser headers for upstream requests (2025-09-30 更新：修复426错误)
 const X_FE_VERSION = "prod-fe-1.0.94"; // 更新：1.0.70 → 1.0.94
@@ -122,6 +129,15 @@ interface DailyStats {
   slowestResponse?: number; // slowest response of the day
 }
 
+// Account management structures
+interface ZaiAccount {
+  email: string;
+  password: string;
+  token: string;
+  apikey?: string | null;  // 新增 APIKEY 字段（可选）
+  createdAt: string;
+}
+
 interface LiveRequest {
   id: string;
   timestamp: Date;
@@ -221,7 +237,7 @@ async function getTokenFromKVPool(): Promise<string | null> {
 }
 
 // Initialize Deno KV database (for local storage)
-let kv: Deno.Kv;
+let kv: Deno.Kv | null = null;
 
 // Initialize database connection
 async function initDB() {
@@ -229,8 +245,106 @@ async function initDB() {
     kv = await Deno.openKv();
     debugLog("Deno KV database initialized");
   } catch (error) {
-    console.error("Failed to initialize Deno KV:", error);
+    console.error("❌ Failed to initialize Deno KV:", error);
+    console.error("⚠️  WARNING: Admin features and account management will NOT work!");
+    console.error("   Please ensure Deno has --unstable-kv flag enabled.");
   }
+}
+
+// ==================== Authentication & Session Management ====================
+
+/**
+ * Generate unique session ID
+ */
+function generateSessionId(): string {
+  return crypto.randomUUID();
+}
+
+/**
+ * Check if request is authenticated (read session from KV)
+ * @param req HTTP request object
+ * @returns authentication status and session ID
+ */
+async function checkAuth(req: Request): Promise<{ authenticated: boolean; sessionId?: string }> {
+  if (!ADMIN_ENABLED || !kv) {
+    return { authenticated: true }; // If admin disabled, allow all
+  }
+
+  const cookies = req.headers.get("Cookie") || "";
+  const sessionMatch = cookies.match(/adminSessionId=([^;]+)/);
+
+  if (sessionMatch) {
+    const sessionId = sessionMatch[1];
+    const sessionKey = ["admin_sessions", sessionId];
+    const session = await kv.get(sessionKey);
+
+    if (session.value) {
+      return { authenticated: true, sessionId };
+    }
+  }
+
+  return { authenticated: false };
+}
+
+// ==================== Account Management Functions ====================
+
+/**
+ * Save account to KV database
+ */
+async function saveAccountToKV(email: string, password: string, token: string, apikey?: string): Promise<void> {
+  if (!kv) {
+    console.warn("⚠️  Cannot save account: KV database not available");
+    return;
+  }
+
+  try {
+    const timestamp = Date.now();
+    const key = ["zai_accounts", timestamp, email];
+    await kv.set(key, {
+      email,
+      password,
+      token,
+      apikey: apikey || null,  // 支持 APIKEY 字段
+      createdAt: new Date().toISOString()
+    });
+    debugLog(`Account saved: ${email}`);
+  } catch (error) {
+    console.error("❌ Failed to save account to KV:", error);
+    throw error; // Re-throw to let caller handle it
+  }
+}
+
+/**
+ * Get all accounts from KV database
+ */
+async function getAllAccounts(): Promise<ZaiAccount[]> {
+  if (!kv) return [];
+
+  const accounts: ZaiAccount[] = [];
+  const entries = kv.list({ prefix: ["zai_accounts"] }, { reverse: true });
+
+  for await (const entry of entries) {
+    accounts.push(entry.value as ZaiAccount);
+  }
+
+  return accounts;
+}
+
+/**
+ * Check if account already exists
+ */
+async function accountExists(email: string): Promise<boolean> {
+  if (!kv) return false;
+
+  const entries = kv.list({ prefix: ["zai_accounts"] });
+  for await (const entry of entries) {
+    const data = entry.value as ZaiAccount;
+    if (data.email === email) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 // Get current hour key (format: YYYY-MM-DD-HH)
@@ -460,6 +574,25 @@ async function cleanupOldData() {
         await kv.delete(entry.key);
         debugLog("Deleted old daily data:", date);
       }
+    }
+
+    // Cleanup expired admin sessions (older than 24 hours)
+    // Note: Sessions have expireIn set, but we manually cleanup to free quota
+    const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    const sessionPrefix = ["admin_sessions"];
+    const sessionEntries = kv.list({ prefix: sessionPrefix });
+
+    let cleanedSessions = 0;
+    for await (const entry of sessionEntries) {
+      const sessionData = entry.value as { createdAt: number };
+      if (sessionData.createdAt < oneDayAgo) {
+        await kv.delete(entry.key);
+        cleanedSessions++;
+      }
+    }
+
+    if (cleanedSessions > 0) {
+      debugLog(`Cleaned up ${cleanedSessions} expired session(s)`);
     }
   } catch (error) {
     debugLog("Error cleaning up old data:", error);
@@ -2015,9 +2148,9 @@ const playgroundHTML = `<!DOCTYPE html>
                 <!-- API Key -->
                 <div class="mb-4">
                     <label class="block text-sm font-medium text-gray-700 mb-2">API Key</label>
-                    <input type="text" id="apiKey" value="${DEFAULT_KEY}"
+                    <input type="text" id="apiKey" value=""
                            class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent"
-                           placeholder="sk-your-key">
+                           placeholder="请输入你的 API Key (例如: sk-your-key)">
                 </div>
 
                 <!-- ZAI Token (Optional) -->
@@ -2890,7 +3023,7 @@ const apiDocsHTML = `<!DOCTYPE html>
             <h2 class="text-2xl font-bold text-gray-900 mb-4">🔐 身份验证</h2>
             <p class="text-gray-700 mb-4">所有 API 请求都需要在请求头中包含 Bearer Token：</p>
             <div class="bg-gray-900 rounded-lg p-4 overflow-x-auto">
-                <code class="text-green-400 font-mono text-sm">Authorization: Bearer ${DEFAULT_KEY}</code>
+                <code class="text-green-400 font-mono text-sm">Authorization: Bearer $你设置的 DEFAULT_KEY</code>
             </div>
         </div>
 
@@ -2905,7 +3038,7 @@ const apiDocsHTML = `<!DOCTYPE html>
                 <p class="text-gray-700 mb-3">获取可用模型列表</p>
                 <div class="bg-gray-900 rounded-lg p-4 overflow-x-auto">
                     <pre class="text-green-400 font-mono text-sm">curl https://zto2api.deno.dev/v1/models \\
-  -H "Authorization: Bearer ${DEFAULT_KEY}"</pre>
+  -H "Authorization: Bearer $你设置的 DEFAULT_KEY"</pre>
                 </div>
             </div>
 
@@ -2942,7 +3075,7 @@ const apiDocsHTML = `<!DOCTYPE html>
                 <div class="bg-gray-900 rounded-lg p-4 overflow-x-auto">
                     <pre class="text-green-400 font-mono text-sm">curl -X POST https://zto2api.deno.dev/v1/chat/completions \\
   -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer ${DEFAULT_KEY}" \\
+  -H "Authorization: Bearer $你设置的 DEFAULT_KEY" \\
   -d '{
     "model": "${MODEL_NAME}",
     "messages": [
@@ -2960,7 +3093,7 @@ const apiDocsHTML = `<!DOCTYPE html>
                 <pre class="text-green-400 font-mono text-sm">import openai
 
 client = openai.OpenAI(
-    api_key="${DEFAULT_KEY}",
+    api_key="$你设置的 DEFAULT_KEY",
     base_url="https://zto2api.deno.dev/v1"
 )
 
@@ -3164,6 +3297,582 @@ Selected token from KV pool: xxx@domain.com (10 accounts available)</pre>
 </body>
 </html>`;
 
+// Admin Login Page HTML
+const adminLoginHTML = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>管理员登录 - ZtoApi</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gradient-to-br from-indigo-500 via-purple-500 to-pink-500 min-h-screen flex items-center justify-center p-4">
+    <div class="bg-white rounded-2xl shadow-2xl p-8 w-full max-w-md">
+        <div class="text-center mb-8">
+            <h1 class="text-3xl font-bold text-gray-800 mb-2">🔐 管理员登录</h1>
+            <p class="text-gray-600">ZtoApi 账号管理系统</p>
+        </div>
+
+        <form id="loginForm" class="space-y-6">
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-2">用户名</label>
+                <input type="text" id="username" required
+                    class="w-full px-4 py-3 border-2 border-gray-200 rounded-lg focus:border-indigo-500 focus:ring focus:ring-indigo-200 transition">
+            </div>
+
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-2">密码</label>
+                <input type="password" id="password" required
+                    class="w-full px-4 py-3 border-2 border-gray-200 rounded-lg focus:border-indigo-500 focus:ring focus:ring-indigo-200 transition">
+            </div>
+
+            <div id="errorMsg" class="hidden text-red-500 text-sm text-center"></div>
+
+            <button type="submit"
+                class="w-full px-6 py-3 bg-gradient-to-r from-indigo-500 to-purple-600 text-white font-semibold rounded-lg shadow-lg hover:shadow-xl hover:-translate-y-0.5 transition-all">
+                登录
+            </button>
+        </form>
+    </div>
+
+    <script>
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            const errorMsg = document.getElementById('errorMsg');
+
+            errorMsg.classList.add('hidden');
+
+            try {
+                const response = await fetch('/admin/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    document.cookie = 'adminSessionId=' + result.sessionId + '; path=/; max-age=86400';
+                    window.location.href = '/admin';
+                } else {
+                    errorMsg.textContent = result.error || '登录失败';
+                    errorMsg.classList.remove('hidden');
+                }
+            } catch (error) {
+                errorMsg.textContent = '网络错误，请重试';
+                errorMsg.classList.remove('hidden');
+            }
+        });
+    </script>
+</body>
+</html>`;
+
+// Admin Panel HTML
+const adminPanelHTML = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>账号管理 - ZtoApi</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+</head>
+<body class="bg-gradient-to-br from-indigo-500 via-purple-500 to-pink-500 min-h-screen p-4 md:p-8">
+    <div class="max-w-7xl mx-auto">
+        <div class="text-center text-white mb-8">
+            <div class="flex items-center justify-between">
+                <div class="flex-1"></div>
+                <div class="flex-1 text-center">
+                    <h1 class="text-4xl md:text-5xl font-bold mb-3">🔐 ZtoApi 账号管理</h1>
+                    <p class="text-lg md:text-xl opacity-90">导入导出 · 数据管理</p>
+                </div>
+                <div class="flex-1 flex justify-end gap-2">
+                    <a href="/dashboard" class="px-4 py-2 bg-white/20 hover:bg-white/30 rounded-lg text-white font-semibold transition">
+                        统计面板
+                    </a>
+                    <button id="logoutBtn" class="px-4 py-2 bg-white/20 hover:bg-white/30 rounded-lg text-white font-semibold transition">
+                        退出登录
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 统计面板 -->
+        <div class="bg-white rounded-2xl shadow-2xl p-6 mb-6">
+            <h2 class="text-2xl font-bold text-gray-800 mb-4">统计信息</h2>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div class="bg-gradient-to-br from-green-400 to-emerald-500 rounded-xl p-4 text-center text-white">
+                    <div class="text-sm opacity-90 mb-1">总账号数</div>
+                    <div class="text-3xl font-bold" id="totalAccounts">0</div>
+                </div>
+                <div class="bg-gradient-to-br from-blue-400 to-indigo-500 rounded-xl p-4 text-center text-white">
+                    <div class="text-sm opacity-90 mb-1">最近导入</div>
+                    <div class="text-3xl font-bold" id="recentImport">0</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 账号列表 -->
+        <div class="bg-white rounded-2xl shadow-2xl p-6 mb-6">
+            <div class="flex items-center justify-between mb-4">
+                <h2 class="text-2xl font-bold text-gray-800">账号列表</h2>
+                <div class="flex gap-2">
+                    <input type="text" id="searchInput" placeholder="搜索邮箱..."
+                        class="px-4 py-2 border-2 border-gray-200 rounded-lg focus:border-indigo-500 focus:ring focus:ring-indigo-200 transition">
+                    <input type="file" id="importFileInput" accept=".txt" style="display: none;">
+                    <button id="importBtn"
+                        class="px-6 py-2 bg-gradient-to-r from-purple-500 to-violet-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition">
+                        导入 TXT
+                    </button>
+                    <button id="exportBtn"
+                        class="px-6 py-2 bg-gradient-to-r from-green-500 to-emerald-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition">
+                        导出 TXT
+                    </button>
+                    <button id="refreshBtn"
+                        class="px-6 py-2 bg-gradient-to-r from-blue-500 to-indigo-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition">
+                        刷新
+                    </button>
+                </div>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full">
+                    <thead>
+                        <tr class="bg-gray-50 text-left">
+                            <th class="px-4 py-3 text-sm font-semibold text-gray-700">序号</th>
+                            <th class="px-4 py-3 text-sm font-semibold text-gray-700">邮箱</th>
+                            <th class="px-4 py-3 text-sm font-semibold text-gray-700">密码</th>
+                            <th class="px-4 py-3 text-sm font-semibold text-gray-700">Token</th>
+                            <th class="px-4 py-3 text-sm font-semibold text-gray-700">APIKEY</th>
+                            <th class="px-4 py-3 text-sm font-semibold text-gray-700">创建时间</th>
+                            <th class="px-4 py-3 text-sm font-semibold text-gray-700">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="accountTableBody" class="divide-y divide-gray-200">
+                        <tr>
+                            <td colspan="7" class="px-4 py-8 text-center text-gray-400">加载中...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- 分页控件 -->
+            <div class="flex items-center justify-between mt-4 px-4 border-t pt-4">
+                <div class="text-sm text-gray-600">
+                    共 <span id="totalItems" class="font-semibold text-indigo-600">0</span> 条数据，
+                    每页显示 <span id="currentPageSize" class="font-semibold text-indigo-600">20</span> 条
+                </div>
+                <div class="flex items-center gap-2">
+                    <!-- 每页显示条数 -->
+                    <select id="pageSizeSelect" class="px-3 py-2 border border-gray-300 rounded-lg focus:border-indigo-500 focus:ring focus:ring-indigo-200 transition text-sm">
+                        <option value="10">10 条/页</option>
+                        <option value="20" selected>20 条/页</option>
+                        <option value="50">50 条/页</option>
+                        <option value="100">100 条/页</option>
+                    </select>
+
+                    <!-- 页码按钮 -->
+                    <div class="flex items-center gap-1">
+                        <button id="firstPageBtn" class="px-3 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition text-sm font-medium" title="首页">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 19l-7-7 7-7m8 14l-7-7 7-7"></path>
+                            </svg>
+                        </button>
+                        <button id="prevPageBtn" class="px-3 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition text-sm font-medium" title="上一页">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path>
+                            </svg>
+                        </button>
+
+                        <div class="flex items-center gap-1" id="pageNumbers"></div>
+
+                        <button id="nextPageBtn" class="px-3 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition text-sm font-medium" title="下一页">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path>
+                            </svg>
+                        </button>
+                        <button id="lastPageBtn" class="px-3 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition text-sm font-medium" title="尾页">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 5l7 7-7 7M5 5l7 7-7 7"></path>
+                            </svg>
+                        </button>
+                    </div>
+
+                    <!-- 跳转页码 -->
+                    <div class="flex items-center gap-2 ml-2">
+                        <span class="text-sm text-gray-600">前往</span>
+                        <input type="number" id="jumpPageInput" min="1" class="w-16 px-2 py-2 border border-gray-300 rounded-lg focus:border-indigo-500 focus:ring focus:ring-indigo-200 transition text-sm text-center">
+                        <button id="jumpPageBtn" class="px-3 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition text-sm font-medium">
+                            跳转
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let accounts = [];
+        let filteredAccounts = [];
+        let currentPage = 1;
+        let pageSize = 20;
+
+        const $totalAccounts = $('#totalAccounts');
+        const $recentImport = $('#recentImport');
+        const $accountTableBody = $('#accountTableBody');
+        const $searchInput = $('#searchInput');
+        const $totalItems = $('#totalItems');
+        const $currentPageSize = $('#currentPageSize');
+        const $pageNumbers = $('#pageNumbers');
+        const $jumpPageInput = $('#jumpPageInput');
+
+        // 渲染表格（带分页）
+        function renderTable(data = filteredAccounts) {
+            const totalPages = Math.ceil(data.length / pageSize);
+
+            // 边界检查
+            if (currentPage < 1) currentPage = 1;
+            if (currentPage > totalPages && totalPages > 0) currentPage = totalPages;
+            if (totalPages === 0) currentPage = 1;
+
+            const startIndex = (currentPage - 1) * pageSize;
+            const endIndex = startIndex + pageSize;
+            const pageData = data.slice(startIndex, endIndex);
+
+            if (data.length === 0) {
+                $accountTableBody.html('<tr><td colspan="7" class="px-4 py-8 text-center text-gray-400">暂无数据</td></tr>');
+            } else if (pageData.length === 0) {
+                $accountTableBody.html('<tr><td colspan="7" class="px-4 py-8 text-center text-gray-400">当前页无数据</td></tr>');
+            } else {
+                const rows = pageData.map((acc, idx) => {
+                    const globalIndex = startIndex + idx + 1;
+                    const tokenPreview = acc.token.length > 20 ? acc.token.substring(0, 20) + '...' : acc.token;
+
+                    // 处理 APIKEY 显示
+                    const apikeyDisplay = acc.apikey ?
+                        '<code class="bg-gray-100 px-2 py-1 rounded text-xs">' + (acc.apikey.length > 20 ? acc.apikey.substring(0, 20) + '...' : acc.apikey) + '</code>' :
+                        '<span class="text-gray-400 text-xs">未生成</span>';
+
+                    return '<tr class="hover:bg-gray-50">' +
+                        '<td class="px-4 py-3 text-sm text-gray-700">' + globalIndex + '</td>' +
+                        '<td class="px-4 py-3 text-sm text-gray-700">' + acc.email + '</td>' +
+                        '<td class="px-4 py-3 text-sm text-gray-700"><code class="bg-gray-100 px-2 py-1 rounded">' + acc.password + '</code></td>' +
+                        '<td class="px-4 py-3 text-sm text-gray-700"><code class="bg-gray-100 px-2 py-1 rounded text-xs">' + tokenPreview + '</code></td>' +
+                        '<td class="px-4 py-3 text-sm text-gray-700">' + apikeyDisplay + '</td>' +
+                        '<td class="px-4 py-3 text-sm text-gray-700">' + new Date(acc.createdAt).toLocaleString('zh-CN') + '</td>' +
+                        '<td class="px-4 py-3 flex gap-2">' +
+                            '<button class="copy-account-btn text-blue-600 hover:text-blue-800 text-sm font-medium" data-email="' + acc.email + '" data-password="' + acc.password + '">复制账号</button>' +
+                            '<button class="copy-token-btn text-green-600 hover:text-green-800 text-sm font-medium" data-token="' + acc.token + '">复制Token</button>' +
+                            (acc.apikey ? '<button class="copy-apikey-btn text-purple-600 hover:text-purple-800 text-sm font-medium" data-apikey="' + acc.apikey + '">复制APIKEY</button>' : '') +
+                        '</td>' +
+                    '</tr>';
+                });
+                $accountTableBody.html(rows.join(''));
+
+                // 绑定复制事件
+                $('.copy-account-btn').on('click', function() {
+                    const email = $(this).data('email');
+                    const password = $(this).data('password');
+                    navigator.clipboard.writeText(email + '----' + password);
+                    alert('已复制账号: ' + email);
+                });
+
+                $('.copy-token-btn').on('click', function() {
+                    const token = $(this).data('token');
+                    navigator.clipboard.writeText(token);
+                    alert('已复制 Token');
+                });
+
+                $('.copy-apikey-btn').on('click', function() {
+                    const apikey = $(this).data('apikey');
+                    navigator.clipboard.writeText(apikey);
+                    alert('已复制 APIKEY');
+                });
+            }
+
+            // 更新分页信息
+            updatePagination(data.length, totalPages);
+        }
+
+        // 更新分页控件
+        function updatePagination(totalItems, totalPages) {
+            $totalItems.text(totalItems);
+            $currentPageSize.text(pageSize);
+
+            // 更新按钮状态
+            $('#firstPageBtn, #prevPageBtn').prop('disabled', currentPage === 1);
+            $('#nextPageBtn, #lastPageBtn').prop('disabled', currentPage === totalPages || totalPages === 0);
+
+            // 渲染页码（参考 Element UI 的分页逻辑）
+            $pageNumbers.empty();
+
+            if (totalPages === 0) return;
+
+            const pagerCount = 7; // 显示的页码按钮数量
+            let showPrevMore = false;
+            let showNextMore = false;
+
+            if (totalPages > pagerCount) {
+                if (currentPage > pagerCount - 3) {
+                    showPrevMore = true;
+                }
+                if (currentPage < totalPages - 3) {
+                    showNextMore = true;
+                }
+            }
+
+            const array = [];
+
+            if (showPrevMore && !showNextMore) {
+                const startPage = totalPages - (pagerCount - 2);
+                for (let i = startPage; i < totalPages; i++) {
+                    array.push(i);
+                }
+            } else if (!showPrevMore && showNextMore) {
+                for (let i = 2; i < pagerCount; i++) {
+                    array.push(i);
+                }
+            } else if (showPrevMore && showNextMore) {
+                const offset = Math.floor(pagerCount / 2) - 1;
+                for (let i = currentPage - offset; i <= currentPage + offset; i++) {
+                    array.push(i);
+                }
+            } else {
+                for (let i = 2; i < totalPages; i++) {
+                    array.push(i);
+                }
+            }
+
+            // 第一页
+            addPageButton(1, $pageNumbers);
+
+            // 前省略号
+            if (showPrevMore) {
+                $pageNumbers.append('<button class="px-3 py-2 text-gray-600 hover:text-indigo-600 transition more-btn" data-action="prev-more">...</button>');
+            }
+
+            // 中间页码
+            array.forEach(page => addPageButton(page, $pageNumbers));
+
+            // 后省略号
+            if (showNextMore) {
+                $pageNumbers.append('<button class="px-3 py-2 text-gray-600 hover:text-indigo-600 transition more-btn" data-action="next-more">...</button>');
+            }
+
+            // 最后一页
+            if (totalPages > 1) {
+                addPageButton(totalPages, $pageNumbers);
+            }
+
+            // 绑定省略号点击事件（快速跳转5页）
+            $('.more-btn').on('click', function() {
+                const action = $(this).data('action');
+                if (action === 'prev-more') {
+                    currentPage = Math.max(1, currentPage - 5);
+                } else if (action === 'next-more') {
+                    currentPage = Math.min(totalPages, currentPage + 5);
+                }
+                renderTable();
+            });
+        }
+
+        // 添加页码按钮
+        function addPageButton(page, container) {
+            const isActive = page === currentPage;
+            const $btn = $('<button>', {
+                text: page,
+                class: 'px-3 py-2 rounded-lg transition text-sm font-medium ' +
+                       (isActive
+                           ? 'bg-indigo-600 text-white'
+                           : 'border border-gray-300 hover:bg-gray-50'),
+                click: () => {
+                    currentPage = page;
+                    renderTable();
+                }
+            });
+            container.append($btn);
+        }
+
+        // 加载账号列表
+        async function loadAccounts() {
+            try {
+                const response = await fetch('/admin/api/accounts');
+                accounts = await response.json();
+                filteredAccounts = accounts;
+                $totalAccounts.text(accounts.length);
+                currentPage = 1; // 重置到第一页
+                renderTable();
+            } catch (error) {
+                alert('加载账号失败: ' + error.message);
+            }
+        }
+
+        // 搜索功能
+        $searchInput.on('input', function() {
+            const keyword = $(this).val().toLowerCase();
+            filteredAccounts = accounts.filter(acc => acc.email.toLowerCase().includes(keyword));
+            currentPage = 1; // 搜索后重置到第一页
+            renderTable();
+        });
+
+        // 分页按钮事件
+        $('#firstPageBtn').on('click', () => {
+            currentPage = 1;
+            renderTable();
+        });
+
+        $('#prevPageBtn').on('click', () => {
+            if (currentPage > 1) {
+                currentPage--;
+                renderTable();
+            }
+        });
+
+        $('#nextPageBtn').on('click', () => {
+            const totalPages = Math.ceil(filteredAccounts.length / pageSize);
+            if (currentPage < totalPages) {
+                currentPage++;
+                renderTable();
+            }
+        });
+
+        $('#lastPageBtn').on('click', () => {
+            const totalPages = Math.ceil(filteredAccounts.length / pageSize);
+            currentPage = totalPages;
+            renderTable();
+        });
+
+        // 每页显示条数变更
+        $('#pageSizeSelect').on('change', function() {
+            pageSize = parseInt($(this).val());
+            currentPage = 1; // 重置到第一页
+            renderTable();
+        });
+
+        // 跳转到指定页
+        $('#jumpPageBtn').on('click', () => {
+            const targetPage = parseInt($jumpPageInput.val());
+            const totalPages = Math.ceil(filteredAccounts.length / pageSize);
+
+            if (!targetPage || targetPage < 1 || targetPage > totalPages) {
+                alert('请输入有效的页码（1-' + totalPages + '）');
+                return;
+            }
+
+            currentPage = targetPage;
+            $jumpPageInput.val(''); // 清空输入框
+            renderTable();
+        });
+
+        // 回车快速跳转
+        $jumpPageInput.on('keypress', function(e) {
+            if (e.which === 13) {
+                $('#jumpPageBtn').click();
+            }
+        });
+
+        $('#refreshBtn').on('click', loadAccounts);
+
+        $('#exportBtn').on('click', async function() {
+            try {
+                const response = await fetch('/admin/api/export');
+                const blob = await response.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'zai_accounts_' + Date.now() + '.txt';
+                a.click();
+                alert('导出成功！');
+            } catch (error) {
+                alert('导出失败: ' + error.message);
+            }
+        });
+
+        $('#importBtn').on('click', function() {
+            $('#importFileInput').click();
+        });
+
+        $('#importFileInput').on('change', async function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            try {
+                const text = await file.text();
+                const lines = text.split('\\n').filter(line => line.trim());
+
+                const importData = [];
+                const emailSet = new Set();
+
+                for (const line of lines) {
+                    const parts = line.split('----');
+                    let email, password, token, apikey;
+
+                    if (parts.length >= 5) {
+                        // 五字段格式：email----password----token_part1----token_part2----apikey
+                        email = parts[0].trim();
+                        password = parts[1].trim();
+                        token = parts[2].trim() + '----' + parts[3].trim();
+                        apikey = parts[4].trim() || null;
+                    } else if (parts.length === 4) {
+                        // 四字段格式：email----password----token----apikey
+                        email = parts[0].trim();
+                        password = parts[1].trim();
+                        token = parts[2].trim();
+                        apikey = parts[3].trim() || null;
+                    } else if (parts.length === 3) {
+                        // 三字段格式（旧格式）：email----password----token
+                        email = parts[0].trim();
+                        password = parts[1].trim();
+                        token = parts[2].trim();
+                        apikey = null;
+                    } else {
+                        continue;
+                    }
+
+                    if (!emailSet.has(email)) {
+                        emailSet.add(email);
+                        importData.push({ email, password, token, apikey });
+                    }
+                }
+
+                const response = await fetch('/admin/api/import-batch', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ accounts: importData })
+                });
+
+                const result = await response.json();
+                if (result.success) {
+                    alert('导入完成！成功: ' + result.imported + ', 跳过重复: ' + result.skipped);
+                    $recentImport.text(result.imported);
+                    await loadAccounts();
+                } else {
+                    alert('导入失败: ' + result.error);
+                }
+
+                $(this).val('');
+            } catch (error) {
+                alert('导入失败: ' + error.message);
+            }
+        });
+
+        $('#logoutBtn').on('click', async function() {
+            if (confirm('确定要退出登录吗？')) {
+                await fetch('/admin/api/logout', { method: 'POST' });
+                document.cookie = 'adminSessionId=; path=/; max-age=0';
+                window.location.href = '/admin/login';
+            }
+        });
+
+        $(document).ready(function() {
+            loadAccounts();
+        });
+    </script>
+</body>
+</html>`;
+
 // Main request handler
 async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
@@ -3208,6 +3917,15 @@ async function handler(req: Request): Promise<Response> {
   }
 
   if (path === "/playground" && req.method === "GET") {
+    // Require authentication for playground
+    const auth = await checkAuth(req);
+    if (!auth.authenticated) {
+      return new Response(null, {
+        status: 302,
+        headers: { "Location": "/admin/login" }
+      });
+    }
+
     return new Response(playgroundHTML, {
       status: 200,
       headers: { "Content-Type": "text/html; charset=utf-8" },
@@ -3281,6 +3999,210 @@ async function handler(req: Request): Promise<Response> {
     }
   }
 
+  // ==================== Account Management Routes ====================
+
+  if (ADMIN_ENABLED) {
+    // Admin login page (no auth required)
+    if (path === "/admin/login" && req.method === "GET") {
+      return new Response(adminLoginHTML, {
+        status: 200,
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      });
+    }
+
+    // Admin login API (no auth required)
+    if (path === "/admin/api/login" && req.method === "POST") {
+      try {
+        if (!kv) {
+          return new Response(JSON.stringify({
+            success: false,
+            error: "管理功能不可用: KV 数据库未初始化"
+          }), {
+            status: 503,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+
+        const body = await req.json();
+        if (body.username === ADMIN_USERNAME && body.password === ADMIN_PASSWORD) {
+          const sessionId = generateSessionId();
+          const sessionKey = ["admin_sessions", sessionId];
+
+          try {
+            await kv.set(sessionKey, { createdAt: Date.now() }, { expireIn: 86400000 }); // 24 hours
+          } catch (error) {
+            console.error("❌ Failed to save session to KV:", error);
+
+            // Check if it's a quota exhausted error
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            if (errorMessage.includes("quota is exhausted")) {
+              return new Response(JSON.stringify({
+                success: false,
+                error: "KV 存储配额已耗尽，请联系管理员清理数据或升级配额"
+              }), {
+                status: 507, // Insufficient Storage
+                headers: { "Content-Type": "application/json" }
+              });
+            }
+
+            return new Response(JSON.stringify({
+              success: false,
+              error: "登录失败: 无法保存会话"
+            }), {
+              status: 500,
+              headers: { "Content-Type": "application/json" }
+            });
+          }
+
+          return new Response(JSON.stringify({ success: true, sessionId }), {
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+        return new Response(JSON.stringify({ success: false, error: "用户名或密码错误" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json" }
+        });
+      } catch (error: unknown) {
+        const errorMessage = error instanceof Error ? error.message : '未知错误';
+        return new Response(JSON.stringify({
+          success: false,
+          error: `请求错误: ${errorMessage}`,
+        }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+    }
+
+    // All other admin routes require authentication
+    const auth = await checkAuth(req);
+
+    if (!auth.authenticated && !path.startsWith("/admin/api/login") && !path.startsWith("/admin/login")) {
+      if (path.startsWith("/admin/api/")) {
+        return new Response(JSON.stringify({ success: false, error: "未授权" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      return new Response(null, {
+        status: 302,
+        headers: { "Location": "/admin/login" }
+      });
+    }
+
+    // Admin logout API
+    if (path === "/admin/api/logout" && req.method === "POST") {
+      if (auth.sessionId) {
+        const sessionKey = ["admin_sessions", auth.sessionId];
+        await kv.delete(sessionKey);
+      }
+      return new Response(JSON.stringify({ success: true }), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    // Admin panel main page
+    if (path === "/admin" && req.method === "GET") {
+      const auth = await checkAuth(req);
+      if (!auth.authenticated) {
+        return new Response(null, {
+          status: 302,
+          headers: { "Location": "/admin/login" }
+        });
+      }
+      return new Response(adminPanelHTML, {
+        status: 200,
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      });
+    }
+
+    // Get all accounts (with pagination and search)
+    if (path === "/admin/api/accounts" && req.method === "GET") {
+      const accounts = await getAllAccounts();
+      const search = url.searchParams.get("search") || "";
+
+      let filteredAccounts = accounts;
+      if (search) {
+        filteredAccounts = accounts.filter(acc =>
+          acc.email.toLowerCase().includes(search.toLowerCase())
+        );
+      }
+
+      return new Response(JSON.stringify(filteredAccounts), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    // Export accounts as TXT
+    if (path === "/admin/api/export" && req.method === "GET") {
+      const accounts = await getAllAccounts();
+      const lines: string[] = [];
+
+      for (const acc of accounts) {
+        // 支持四字段格式：账号----密码----Token----APIKEY
+        if (acc.apikey) {
+          lines.push(`${acc.email}----${acc.password}----${acc.token}----${acc.apikey}`);
+        } else {
+          // 兼容旧格式，APIKEY 为空
+          lines.push(`${acc.email}----${acc.password}----${acc.token}----`);
+        }
+      }
+
+      return new Response(lines.join('\n'), {
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Content-Disposition": `attachment; filename="zai_accounts_${Date.now()}.txt"`
+        }
+      });
+    }
+
+    // Batch import accounts from TXT
+    if (path === "/admin/api/import-batch" && req.method === "POST") {
+      try {
+        const body = await req.json();
+        const { accounts: importAccounts } = body;
+
+        if (!Array.isArray(importAccounts)) {
+          return new Response(JSON.stringify({ success: false, error: "数据格式错误" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+
+        let imported = 0;
+        let skipped = 0;
+
+        for (const acc of importAccounts) {
+          const { email, password, token, apikey } = acc;
+
+          if (!email || !password || !token) {
+            skipped++;
+            continue;
+          }
+
+          // Check if account already exists
+          if (await accountExists(email)) {
+            skipped++;
+            continue;
+          }
+
+          await saveAccountToKV(email, password, token, apikey);
+          imported++;
+        }
+
+        return new Response(JSON.stringify({ success: true, imported, skipped }), {
+          headers: { "Content-Type": "application/json" }
+        });
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return new Response(JSON.stringify({ success: false, error: msg }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+    }
+  }
+
   return new Response("Not Found", { status: 404 });
 }
 
@@ -3310,9 +4232,28 @@ if (DASHBOARD_ENABLED) {
 }
 console.log(`📖 API Docs: http://localhost:${PORT}/docs`);
 
+if (ADMIN_ENABLED) {
+  console.log(`🔐 Admin Panel: http://localhost:${PORT}/admin (Username: ${ADMIN_USERNAME})`);
+}
+
 // Initialize database and KV token pool
 await initDB();
 await initKVTokenPool();
+
+// Check KV availability and warn if not available
+if (ADMIN_ENABLED && !kv) {
+  console.warn("⚠️  WARNING: Deno KV is not available!");
+  console.warn("   - Admin panel login will NOT work");
+  console.warn("   - Account management will NOT work");
+  console.warn("   - Playground will NOT be accessible");
+  console.warn("   Please run with: deno run --allow-net --allow-env --allow-read --unstable-kv main.ts");
+}
+
+// Cleanup old data on startup to free KV quota
+if (kv) {
+  await cleanupOldData();
+  console.log("✓ Initial data cleanup completed");
+}
 
 // Schedule daily stats aggregation and cleanup (runs every hour)
 setInterval(async () => {

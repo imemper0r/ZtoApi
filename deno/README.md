@@ -63,7 +63,7 @@ cd ../my-service
 | 项目 | 目标服务 | 状态 | 特点 |
 |------|---------|------|------|
 | **template** | 通用模板 | ✅ 完成 | 可配置框架，包含完整功能 |
-| **zai** | Z.ai GLM-4.5 | ✅ 完成 | Thinking 模式、匿名 token、X-Signature |
+| **zai** | Z.ai GLM-4.5 | ✅ 完成 | Thinking 模式、匿名 token、账号管理、批量注册 |
 | **dphn** | Dolphin AI | ✅ 完成 | 多模板、system 消息转换 |
 
 ## 🎯 模板特性
@@ -109,6 +109,9 @@ cd ../my-service
 
 - **[TEMPLATE_GUIDE.md](./TEMPLATE_GUIDE.md)** - 如何使用模板创建新代理
 - **[template/README.md](./template/README.md)** - 模板详细文档
+- **[zai/README.md](./zai/README.md)** - Z.ai GLM-4.5 代理使用文档
+- **[zai/ADMIN_GUIDE.md](./zai/ADMIN_GUIDE.md)** - Z.ai 账号管理系统使用指南
+- **[zai/zai_register.md](./zai/zai_register.md)** - Z.ai 批量注册工具使用文档
 - **[dphn/README.md](./dphn/README.md)** - Dolphin AI 代理使用文档
 
 ## 🔧 从模板创建新代理
@@ -185,6 +188,13 @@ deno task dev
 - ✅ 随机浏览器指纹（防检测）
 - ✅ 请求验证和错误处理
 - ✅ 环境变量配置（敏感信息不硬编码）
+
+### Z.ai 项目额外安全增强
+
+- 🔒 **管理面板认证**：基于 Session 的登录系统，24小时自动过期
+- 🔐 **Playground 访问控制**：需登录后才能使用 Playground 测试页面
+- 🛡️ **敏感信息保护**：登录页面和前端不暴露默认密码、API Key 等敏感配置
+- 📋 **账号数据隔离**：使用 Deno KV 本地存储，支持导入导出和批量管理
 
 ## 🚀 部署选项
 

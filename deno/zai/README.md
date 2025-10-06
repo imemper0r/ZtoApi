@@ -7,13 +7,16 @@
 ## ✨ 主要功能
 
 - 🔄 **OpenAI API兼容**: 完全兼容OpenAI的API格式，无需修改客户端代码
-- 🌊 **流式响应支持**: 支持实时流式输出，提供更好的用户体验
+- 🌊 **流式响应支持**: 支持实时流式输出,提供更好的用户体验
 - 🔐 **身份验证**: 支持API密钥验证，确保服务安全
 - 🛠️ **灵活配置**: 通过环境变量进行灵活配置
 - 🐳 **Docker支持**: 提供Docker镜像，便于部署
 - 🌍 **CORS支持**: 支持跨域请求，便于前端集成
 - 📝 **思考过程展示**: 智能处理并展示模型的思考过程
 - 📊 **实时监控仪表板**: 提供Web仪表板，实时显示API转发情况和统计信息
+- 🔑 **账号管理系统**: 支持批量导入导出Z.ai账号（含APIKEY），基于Session认证
+- 🎮 **Playground测试**: 在线测试API请求和响应（需登录）
+- 🤖 **批量注册工具**: 自动批量注册Z.ai账号，支持并发和实时监控
 - 🦕 **Deno运行时**: 使用现代化的Deno运行时，安全且高效
 
 ## 🚀 快速开始
@@ -164,6 +167,11 @@ docker run -p 9090:9090 \
 | 变量名 | 说明 | 默认值 | 示例 |
 |--------|------|--------|------|
 | `UPSTREAM_URL` | 上游API地址 | `https://chat.z.ai/api/chat/completions` | 自定义URL |
+| `ADMIN_USERNAME` | 管理员用户名 | `admin` | `myadmin` |
+| `ADMIN_PASSWORD` | 管理员密码 | `123456` | `strong_password_123` |
+| `ADMIN_ENABLED` | 管理面板开关 | `true` | `false` |
+
+⚠️ **安全提示**：生产环境务必修改 `ADMIN_USERNAME` 和 `ADMIN_PASSWORD`，避免使用默认值。
 
 ### 📁 配置文件
 
@@ -264,6 +272,13 @@ curl -X POST http://localhost:9090/v1/chat/completions \
 - ✅ **内置工具**: 格式化、测试、打包等工具开箱即用
 - ✅ **Web标准**: 使用现代 Web API（fetch、streams等）
 
+### 安全增强
+
+- 🔒 **管理面板认证**: 基于 Session 的登录系统，24小时自动过期
+- 🔐 **Playground 访问控制**: 需登录后才能使用 Playground 测试页面
+- 🛡️ **敏感信息保护**: 登录页面和前端不暴露默认密码、API Key 等敏感配置
+- 📋 **账号数据隔离**: 使用 Deno KV 本地存储，支持导入导出和批量管理（含 APIKEY）
+
 ### 任务命令
 
 ```bash
@@ -310,6 +325,12 @@ deno task cache
 ## 🤝 贡献指南
 
 欢迎提交 Issue 和 Pull Request！
+
+## 📚 相关文档
+
+- **[ADMIN_GUIDE.md](./ADMIN_GUIDE.md)** - 账号管理系统使用指南
+- **[zai_register.md](./zai_register.md)** - 批量注册工具使用文档
+- **[CLAUDE.md](../../CLAUDE.md)** - 项目架构和开发指南
 
 ## 📄 许可证
 
