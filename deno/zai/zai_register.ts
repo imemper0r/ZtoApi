@@ -516,7 +516,7 @@ async function createApiKey(accessToken: string, orgId: string, projectId: strin
   }
 }
 
-async function saveAccount(email: string, password: string, token: string, apikey?: string): Promise<void> {
+async function saveAccount(email: string, password: string, token: string, apikey?: string): Promise<boolean> {
   try {
     const timestamp = Date.now();
     const key = ["zai_accounts", timestamp, email];
@@ -527,6 +527,7 @@ async function saveAccount(email: string, password: string, token: string, apike
       apikey: apikey || null,  // 新增 APIKEY 字段
       createdAt: new Date().toISOString()
     });
+    return true; // 保存成功
   } catch (error) {
     console.error("❌ Failed to save account to KV:", error);
 
@@ -536,9 +537,9 @@ async function saveAccount(email: string, password: string, token: string, apike
       broadcast({
         type: 'log',
         level: 'error',
-        message: `❌ KV 存储配额已耗尽，无法保存账号 ${email}`
+        message: `❌ KV 存储配额已耗尽，账号将保存到本地: ${email}`
       });
-      throw new Error("KV quota exhausted");
+      return false; // 配额耗尽，返回false
     }
 
     throw error; // Re-throw other errors
@@ -699,27 +700,33 @@ async function registerAccount(): Promise<RegisterResult> {
     const accessToken = await loginToApi(userToken);
     if (!accessToken) {
       // 即使API登录失败，也保存账号（只有Token，没有APIKEY）
-      try {
-        await saveAccount(email, password, userToken);
-      } catch (error) {
-        // 如果KV配额耗尽，只广播错误但不中断流程
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        if (errorMessage.includes("KV quota exhausted")) {
-          broadcast({ type: 'log', level: 'error', message: `⚠️ KV配额已耗尽，账号未保存到KV: ${email}` });
-        } else {
-          throw error; // 其他错误继续抛出
-        }
-      }
-      stats.success++;
-      broadcast({
-        type: 'log',
-        level: 'warning',
-        message: `⚠️ 注册成功但API登录失败: ${email} (仅获取Token)`,
-        stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed },
-        link: { text: '查看邮箱', url: emailCheckUrl }
-      });
       const account = { email, password, token: userToken, apikey: null, createdAt: new Date().toISOString() };
-      broadcast({ type: 'account_added', account });
+      const saved = await saveAccount(email, password, userToken);
+
+      if (saved) {
+        // 成功保存到KV
+        stats.success++;
+        broadcast({
+          type: 'log',
+          level: 'warning',
+          message: `⚠️ 注册成功但API登录失败: ${email} (仅获取Token)`,
+          stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed },
+          link: { text: '查看邮箱', url: emailCheckUrl }
+        });
+        broadcast({ type: 'account_added', account });
+      } else {
+        // KV保存失败（配额耗尽），发送local_account_added事件
+        stats.success++;
+        broadcast({
+          type: 'log',
+          level: 'warning',
+          message: `⚠️ 注册成功但API登录失败: ${email} (仅获取Token，已保存到本地)`,
+          stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed },
+          link: { text: '查看邮箱', url: emailCheckUrl }
+        });
+        broadcast({ type: 'local_account_added', account });
+      }
+
       return { success: true, account };
     }
 
@@ -728,27 +735,33 @@ async function registerAccount(): Promise<RegisterResult> {
     const { orgId, projectId } = await getCustomerInfo(accessToken);
     if (!orgId || !projectId) {
       // 保存账号（只有Token，没有APIKEY）
-      try {
-        await saveAccount(email, password, userToken);
-      } catch (error) {
-        // 如果KV配额耗尽，只广播错误但不中断流程
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        if (errorMessage.includes("KV quota exhausted")) {
-          broadcast({ type: 'log', level: 'error', message: `⚠️ KV配额已耗尽，账号未保存到KV: ${email}` });
-        } else {
-          throw error; // 其他错误继续抛出
-        }
-      }
-      stats.success++;
-      broadcast({
-        type: 'log',
-        level: 'warning',
-        message: `⚠️ 注册成功但获取组织信息失败: ${email} (仅获取Token)`,
-        stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed },
-        link: { text: '查看邮箱', url: emailCheckUrl }
-      });
       const account = { email, password, token: userToken, apikey: null, createdAt: new Date().toISOString() };
-      broadcast({ type: 'account_added', account });
+      const saved = await saveAccount(email, password, userToken);
+
+      if (saved) {
+        // 成功保存到KV
+        stats.success++;
+        broadcast({
+          type: 'log',
+          level: 'warning',
+          message: `⚠️ 注册成功但获取组织信息失败: ${email} (仅获取Token)`,
+          stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed },
+          link: { text: '查看邮箱', url: emailCheckUrl }
+        });
+        broadcast({ type: 'account_added', account });
+      } else {
+        // KV保存失败（配额耗尽），发送local_account_added事件
+        stats.success++;
+        broadcast({
+          type: 'log',
+          level: 'warning',
+          message: `⚠️ 注册成功但获取组织信息失败: ${email} (仅获取Token，已保存到本地)`,
+          stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed },
+          link: { text: '查看邮箱', url: emailCheckUrl }
+        });
+        broadcast({ type: 'local_account_added', account });
+      }
+
       return { success: true, account };
     }
 
@@ -757,39 +770,53 @@ async function registerAccount(): Promise<RegisterResult> {
     const apiKey = await createApiKey(accessToken, orgId, projectId);
 
     // 9. 保存完整账号信息
-    try {
-      await saveAccount(email, password, userToken, apiKey || undefined);
-    } catch (error) {
-      // 如果KV配额耗尽，只广播错误但不中断流程
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      if (errorMessage.includes("KV quota exhausted")) {
-        broadcast({ type: 'log', level: 'error', message: `⚠️ KV配额已耗尽，账号未保存到KV: ${email}` });
-      } else {
-        throw error; // 其他错误继续抛出
-      }
-    }
+    const account = { email, password, token: userToken, apikey: apiKey || null, createdAt: new Date().toISOString() };
+    const saved = await saveAccount(email, password, userToken, apiKey || undefined);
+
     stats.success++;
 
-    const account = { email, password, token: userToken, apikey: apiKey || null, createdAt: new Date().toISOString() };
-
-    if (apiKey) {
-      broadcast({
-        type: 'log',
-        level: 'success',
-        message: `✅ 注册完成: ${email} (包含APIKEY)`,
-        stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed },
-        link: { text: '查看邮箱', url: emailCheckUrl }
-      });
-      broadcast({ type: 'account_added', account });
+    if (saved) {
+      // 成功保存到KV
+      if (apiKey) {
+        broadcast({
+          type: 'log',
+          level: 'success',
+          message: `✅ 注册完成: ${email} (包含APIKEY)`,
+          stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed },
+          link: { text: '查看邮箱', url: emailCheckUrl }
+        });
+        broadcast({ type: 'account_added', account });
+      } else {
+        broadcast({
+          type: 'log',
+          level: 'warning',
+          message: `⚠️ 注册成功但创建API密钥失败: ${email} (仅获取Token)`,
+          stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed },
+          link: { text: '查看邮箱', url: emailCheckUrl }
+        });
+        broadcast({ type: 'account_added', account });
+      }
     } else {
-      broadcast({
-        type: 'log',
-        level: 'warning',
-        message: `⚠️ 注册成功但创建API密钥失败: ${email} (仅获取Token)`,
-        stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed },
-        link: { text: '查看邮箱', url: emailCheckUrl }
-      });
-      broadcast({ type: 'account_added', account });
+      // KV保存失败（配额耗尽），发送local_account_added事件
+      if (apiKey) {
+        broadcast({
+          type: 'log',
+          level: 'success',
+          message: `✅ 注册完成: ${email} (包含APIKEY，已保存到本地)`,
+          stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed },
+          link: { text: '查看邮箱', url: emailCheckUrl }
+        });
+        broadcast({ type: 'local_account_added', account });
+      } else {
+        broadcast({
+          type: 'log',
+          level: 'warning',
+          message: `⚠️ 注册成功但创建API密钥失败: ${email} (仅获取Token，已保存到本地)`,
+          stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed },
+          link: { text: '查看邮箱', url: emailCheckUrl }
+        });
+        broadcast({ type: 'local_account_added', account });
+      }
     }
 
     return { success: true, account };
@@ -1329,10 +1356,14 @@ const HTML_PAGE = `<!DOCTYPE html>
         <!-- 统计面板 -->
         <div class="bg-white rounded-2xl shadow-2xl p-3 sm:p-6 mb-4 sm:mb-6">
             <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-3 sm:mb-4">统计信息</h2>
-            <div class="grid grid-cols-2 md:grid-cols-4 gap-2 sm:gap-4">
+            <div class="grid grid-cols-2 md:grid-cols-5 gap-2 sm:gap-4">
                 <div class="bg-gradient-to-br from-green-400 to-emerald-500 rounded-xl p-3 sm:p-4 text-center text-white">
                     <div class="text-xs sm:text-sm opacity-90 mb-1">总账号</div>
                     <div class="text-2xl sm:text-3xl font-bold" id="totalAccounts">0</div>
+                </div>
+                <div class="bg-gradient-to-br from-cyan-400 to-teal-500 rounded-xl p-3 sm:p-4 text-center text-white">
+                    <div class="text-xs sm:text-sm opacity-90 mb-1">本地账号</div>
+                    <div class="text-2xl sm:text-3xl font-bold" id="localAccountsCount">0</div>
                 </div>
                 <div class="bg-gradient-to-br from-blue-400 to-indigo-500 rounded-xl p-3 sm:p-4 text-center text-white">
                     <div class="text-xs sm:text-sm opacity-90 mb-1">本次成功</div>
@@ -1356,18 +1387,36 @@ const HTML_PAGE = `<!DOCTYPE html>
                 <div class="flex flex-wrap gap-2 w-full sm:w-auto">
                     <input type="text" id="searchInput" placeholder="搜索邮箱..."
                         class="flex-1 sm:flex-none px-3 sm:px-4 py-2 text-sm sm:text-base border-2 border-gray-200 rounded-lg focus:border-indigo-500 focus:ring focus:ring-indigo-200 transition">
+
+                    <!-- 服务端操作 -->
                     <input type="file" id="importFileInput" accept=".txt" style="display: none;">
                     <button id="importBtn"
-                        class="flex-1 sm:flex-none px-3 sm:px-6 py-2 bg-gradient-to-r from-purple-500 to-violet-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-sm sm:text-base whitespace-nowrap">
-                        导入
+                        class="flex-1 sm:flex-none px-3 sm:px-4 py-2 bg-gradient-to-r from-purple-500 to-violet-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-xs sm:text-sm whitespace-nowrap">
+                        📥 导入到服务器
                     </button>
                     <button id="exportBtn"
-                        class="flex-1 sm:flex-none px-3 sm:px-6 py-2 bg-gradient-to-r from-green-500 to-emerald-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-sm sm:text-base whitespace-nowrap">
-                        导出
+                        class="flex-1 sm:flex-none px-3 sm:px-4 py-2 bg-gradient-to-r from-green-500 to-emerald-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-xs sm:text-sm whitespace-nowrap">
+                        📤 导出服务器
                     </button>
+
+                    <!-- 本地操作 -->
+                    <input type="file" id="importLocalFileInput" accept=".txt" style="display: none;">
+                    <button id="importLocalBtn"
+                        class="flex-1 sm:flex-none px-3 sm:px-4 py-2 bg-gradient-to-r from-cyan-500 to-teal-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-xs sm:text-sm whitespace-nowrap">
+                        💾 导入本地
+                    </button>
+                    <button id="exportLocalBtn"
+                        class="flex-1 sm:flex-none px-3 sm:px-4 py-2 bg-gradient-to-r from-orange-500 to-amber-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-xs sm:text-sm whitespace-nowrap">
+                        📦 导出本地
+                    </button>
+                    <button id="syncToServerBtn"
+                        class="flex-1 sm:flex-none px-3 sm:px-4 py-2 bg-gradient-to-r from-indigo-500 to-purple-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-xs sm:text-sm whitespace-nowrap">
+                        🔄 同步到服务器
+                    </button>
+
                     <button id="refreshBtn"
-                        class="flex-1 sm:flex-none px-3 sm:px-6 py-2 bg-gradient-to-r from-blue-500 to-indigo-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-sm sm:text-base whitespace-nowrap">
-                        刷新
+                        class="flex-1 sm:flex-none px-3 sm:px-4 py-2 bg-gradient-to-r from-blue-500 to-indigo-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-xs sm:text-sm whitespace-nowrap">
+                        🔃 刷新
                     </button>
                 </div>
             </div>
@@ -1858,6 +1907,22 @@ const HTML_PAGE = `<!DOCTYPE html>
             }
         });
 
+        // 本地存储操作事件
+        $('#exportLocalBtn').on('click', exportLocalAccounts);
+
+        $('#importLocalBtn').on('click', function() {
+            $('#importLocalFileInput').click();
+        });
+
+        $('#importLocalFileInput').on('change', async function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+            await importToLocal(file);
+            $(this).val(''); // 清空input，允许重复选择同一文件
+        });
+
+        $('#syncToServerBtn').on('click', syncLocalToServer);
+
         $startRegisterBtn.on('click', async function() {
             try {
                 const count = parseInt($('#registerCount').val());
@@ -1913,6 +1978,236 @@ const HTML_PAGE = `<!DOCTYPE html>
             }
         });
 
+        // ========== IndexedDB 操作库 ==========
+        const DB_NAME = 'ZaiAccountsDB';
+        const DB_VERSION = 1;
+        const STORE_NAME = 'accounts';
+
+        let db = null;
+
+        // 初始化 IndexedDB
+        async function initIndexedDB() {
+            return new Promise((resolve, reject) => {
+                const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+                request.onerror = () => {
+                    console.error('IndexedDB初始化失败:', request.error);
+                    addLog('⚠️ 本地存储初始化失败', 'warning');
+                    reject(request.error);
+                };
+
+                request.onsuccess = () => {
+                    db = request.result;
+                    console.log('✓ IndexedDB初始化成功');
+                    loadLocalAccounts(); // 加载本地账号到界面
+                    resolve(db);
+                };
+
+                request.onupgradeneeded = (event) => {
+                    const db = event.target.result;
+
+                    if (!db.objectStoreNames.contains(STORE_NAME)) {
+                        const store = db.createObjectStore(STORE_NAME, { keyPath: 'id', autoIncrement: true });
+                        store.createIndex('email', 'email', { unique: true });
+                        store.createIndex('source', 'source', { unique: false });
+                        store.createIndex('createdAt', 'createdAt', { unique: false });
+                        console.log('✓ 创建IndexedDB表结构');
+                    }
+                };
+            });
+        }
+
+        // 保存账号到 IndexedDB
+        async function saveToLocal(account) {
+            if (!db) {
+                console.warn('IndexedDB未初始化');
+                return false;
+            }
+
+            return new Promise((resolve, reject) => {
+                const transaction = db.transaction([STORE_NAME], 'readwrite');
+                const store = transaction.objectStore(STORE_NAME);
+
+                const accountData = {
+                    email: account.email,
+                    password: account.password,
+                    token: account.token,
+                    apikey: account.apikey || null,
+                    source: account.source || 'local', // local/kv/synced
+                    createdAt: account.createdAt || new Date().toISOString()
+                };
+
+                const request = store.add(accountData);
+
+                request.onsuccess = () => {
+                    console.log('✓ 账号已保存到本地:', account.email);
+                    resolve(true);
+                };
+
+                request.onerror = () => {
+                    if (request.error.name === 'ConstraintError') {
+                        console.log('⚠️ 账号已存在，跳过:', account.email);
+                        resolve(false);
+                    } else {
+                        console.error('保存失败:', request.error);
+                        reject(request.error);
+                    }
+                };
+            });
+        }
+
+        // 获取所有本地账号
+        async function getAllLocalAccounts() {
+            if (!db) return [];
+
+            return new Promise((resolve, reject) => {
+                const transaction = db.transaction([STORE_NAME], 'readonly');
+                const store = transaction.objectStore(STORE_NAME);
+                const request = store.getAll();
+
+                request.onsuccess = () => resolve(request.result);
+                request.onerror = () => reject(request.error);
+            });
+        }
+
+        // 加载本地账号到界面
+        async function loadLocalAccounts() {
+            try {
+                const localAccounts = await getAllLocalAccounts();
+                console.log(\`✓ 加载了 \${localAccounts.length} 个本地账号\`);
+
+                // 合并显示（服务端账号 + 本地账号）
+                // 服务端账号已经在 loadAccounts() 中加载
+                // 这里只需要更新统计信息
+                $('#localAccountsCount').text(localAccounts.filter(a => a.source === 'local').length);
+            } catch (error) {
+                console.error('加载本地账号失败:', error);
+            }
+        }
+
+        // 导出本地账号为TXT
+        async function exportLocalAccounts() {
+            try {
+                const localAccounts = await getAllLocalAccounts();
+                if (localAccounts.length === 0) {
+                    showToast('没有本地账号可导出', 'warning');
+                    return;
+                }
+
+                const content = localAccounts.map(acc =>
+                    \`\${acc.email}----\${acc.password}----\${acc.token}----\${acc.apikey || ''}\`
+                ).join('\\n');
+
+                const blob = new Blob([content], { type: 'text/plain' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = \`zai_local_accounts_\${Date.now()}.txt\`;
+                a.click();
+                URL.revokeObjectURL(url);
+
+                showToast(\`已导出 \${localAccounts.length} 个本地账号\`, 'success');
+            } catch (error) {
+                console.error('导出失败:', error);
+                showToast('导出失败: ' + error.message, 'error');
+            }
+        }
+
+        // 导入TXT到本地存储
+        async function importToLocal(file) {
+            try {
+                const text = await file.text();
+                const lines = text.split('\\n').filter(line => line.trim());
+
+                let imported = 0;
+                let skipped = 0;
+
+                for (const line of lines) {
+                    const parts = line.split('----').map(p => p.trim());
+                    if (parts.length >= 3) {
+                        const account = {
+                            email: parts[0],
+                            password: parts[1],
+                            token: parts[2],
+                            apikey: parts[3] || null,
+                            source: 'local',
+                            createdAt: new Date().toISOString()
+                        };
+
+                        const success = await saveToLocal(account);
+                        if (success) imported++;
+                        else skipped++;
+                    }
+                }
+
+                await loadLocalAccounts();
+                showToast(\`导入完成！成功: \${imported}, 跳过: \${skipped}\`, 'success');
+            } catch (error) {
+                console.error('导入失败:', error);
+                showToast('导入失败: ' + error.message, 'error');
+            }
+        }
+
+        // 同步本地账号到服务器
+        async function syncLocalToServer() {
+            try {
+                const localAccounts = await getAllLocalAccounts();
+                const localOnly = localAccounts.filter(a => a.source === 'local');
+
+                if (localOnly.length === 0) {
+                    showToast('没有需要同步的本地账号', 'info');
+                    return;
+                }
+
+                const response = await fetch('/api/sync-local', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ accounts: localOnly })
+                });
+
+                const result = await response.json();
+
+                if (response.ok && result.success) {
+                    // 更新本地账号状态为已同步
+                    const transaction = db.transaction([STORE_NAME], 'readwrite');
+                    const store = transaction.objectStore(STORE_NAME);
+
+                    for (const acc of localOnly) {
+                        acc.source = 'synced';
+                        store.put(acc);
+                    }
+
+                    await loadLocalAccounts();
+                    showToast(\`同步成功！已同步 \${result.synced} 个账号\`, 'success');
+                } else {
+                    showToast(result.error || '同步失败', 'error');
+                }
+            } catch (error) {
+                console.error('同步失败:', error);
+                showToast('同步失败: ' + error.message, 'error');
+            }
+        }
+
+        // 清空本地存储
+        async function clearLocalAccounts() {
+            if (!db) return;
+
+            if (!confirm('确定要清空所有本地账号吗？此操作不可恢复！')) return;
+
+            return new Promise((resolve, reject) => {
+                const transaction = db.transaction([STORE_NAME], 'readwrite');
+                const store = transaction.objectStore(STORE_NAME);
+                const request = store.clear();
+
+                request.onsuccess = () => {
+                    loadLocalAccounts();
+                    showToast('本地账号已清空', 'success');
+                    resolve();
+                };
+                request.onerror = () => reject(request.error);
+            });
+        }
+
         function connectSSE() {
             const eventSource = new EventSource('/events');
             eventSource.onmessage = (event) => {
@@ -1945,6 +2240,25 @@ const HTML_PAGE = `<!DOCTYPE html>
                         filteredAccounts = accounts;
                         $totalAccounts.text(accounts.length);
                         renderTable();
+
+                        // 同时保存到IndexedDB作为本地备份（标记为kv来源）
+                        if (data.account.source !== 'local') {
+                            data.account.source = 'kv'; // 标记为来自KV的账号
+                            saveToLocal(data.account).catch(err => {
+                                console.warn('保存到本地备份失败:', err);
+                            });
+                        }
+                        break;
+                    case 'local_account_added':
+                        // KV保存失败，仅保存到IndexedDB
+                        data.account.source = 'local'; // 标记为仅本地账号
+                        saveToLocal(data.account).then(() => {
+                            addLog(\`💾 账号已保存到本地存储: \${data.account.email}\`, 'warning');
+                            loadLocalAccounts(); // 更新本地账号统计
+                        }).catch(err => {
+                            console.error('保存到本地失败:', err);
+                            addLog(\`❌ 本地保存失败: \${data.account.email}\`, 'error');
+                        });
                         break;
                     case 'complete':
                         updateStatus(false);
@@ -1964,7 +2278,8 @@ const HTML_PAGE = `<!DOCTYPE html>
             };
         }
 
-        $(document).ready(function() {
+        $(document).ready(async function() {
+            await initIndexedDB(); // 初始化IndexedDB
             loadAccounts();
             loadSettings();
             connectSSE();
@@ -2331,6 +2646,96 @@ async function handler(req: Request): Promise<Response> {
       }
 
       return new Response(JSON.stringify({ success: true, imported, skipped }), {
+        headers: { "Content-Type": "application/json" }
+      });
+    } catch (error: any) {
+      const msg = error instanceof Error ? error.message : String(error);
+      return new Response(JSON.stringify({ success: false, error: msg }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  }
+
+  // 同步本地账号到服务器
+  if (url.pathname === "/api/sync-local" && req.method === "POST") {
+    try {
+      const body = await req.json();
+      const { accounts: localAccounts } = body;
+
+      if (!Array.isArray(localAccounts)) {
+        return new Response(JSON.stringify({ success: false, error: "数据格式错误" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+
+      // 获取已存在的邮箱
+      const existingEmails = new Set();
+      const entries = kv.list({ prefix: ["zai_accounts"] });
+      for await (const entry of entries) {
+        const data = entry.value as any;
+        existingEmails.add(data.email);
+      }
+
+      // 批量同步（去重）
+      let synced = 0;
+      let skipped = 0;
+      let quotaExhausted = false;
+      const timestamp = Date.now();
+
+      for (const [index, acc] of localAccounts.entries()) {
+        const { email, password, token, apikey } = acc;
+
+        if (!email || !password || !token) {
+          skipped++;
+          continue;
+        }
+
+        // 检查是否已存在
+        if (existingEmails.has(email)) {
+          skipped++;
+          continue;
+        }
+
+        // 使用不同的时间戳避免键冲突
+        const key = ["zai_accounts", timestamp + index, email];
+        try {
+          await kv.set(key, {
+            email,
+            password,
+            token,
+            apikey: apikey || null,
+            createdAt: acc.createdAt || new Date().toISOString()
+          });
+
+          existingEmails.add(email);
+          synced++;
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          if (errorMessage.includes("quota is exhausted")) {
+            console.error("❌ KV quota exhausted during sync");
+            quotaExhausted = true;
+            break;
+          }
+          console.error(`Failed to sync account ${email}:`, error);
+          skipped++;
+        }
+      }
+
+      if (quotaExhausted) {
+        return new Response(JSON.stringify({
+          success: false,
+          synced,
+          skipped: skipped + (localAccounts.length - synced - skipped),
+          error: "KV 存储配额已耗尽，已同步 " + synced + " 个账号"
+        }), {
+          status: 507,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+
+      return new Response(JSON.stringify({ success: true, synced, skipped }), {
         headers: { "Content-Type": "application/json" }
       });
     } catch (error: any) {
