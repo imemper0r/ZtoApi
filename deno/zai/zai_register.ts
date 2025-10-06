@@ -19,6 +19,8 @@ import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
 
 const PORT = 8001;  // Web 服务监听端口
 const NOTIFY_INTERVAL = 3600;  // 通知发送间隔（秒）
+const MAX_LOGIN_ATTEMPTS = 5;  // 最大登录失败次数
+const LOGIN_LOCK_DURATION = 900000;  // 登录锁定时长（15分钟）
 
 // 鉴权配置 - 可通过环境变量覆盖
 const AUTH_USERNAME = Deno.env.get("ZAI_USERNAME") || "admin";
@@ -65,6 +67,9 @@ const logHistory: any[] = [];  // 日志历史记录（内存缓存）
 const MAX_LOG_HISTORY = 500;  // 最大日志条数
 let logSaveTimer: number | null = null;  // 日志保存定时器
 const LOG_SAVE_INTERVAL = 30000;  // 日志保存间隔（30秒）
+
+// 登录失败跟踪（IP -> {attempts: number, lockedUntil: number}）
+const loginAttempts = new Map<string, { attempts: number; lockedUntil: number }>();
 
 /**
  * 批量保存日志到 KV（节流）
@@ -153,6 +158,70 @@ function broadcast(data: any) {
  */
 function generateSessionId(): string {
   return crypto.randomUUID();
+}
+
+/**
+ * 获取客户端 IP 地址
+ */
+function getClientIP(req: Request): string {
+  // 优先从 X-Forwarded-For 获取（反向代理场景）
+  const forwarded = req.headers.get("X-Forwarded-For");
+  if (forwarded) {
+    return forwarded.split(',')[0].trim();
+  }
+
+  // 从 X-Real-IP 获取
+  const realIP = req.headers.get("X-Real-IP");
+  if (realIP) {
+    return realIP;
+  }
+
+  // 默认返回占位符（Deno.serve 不直接提供 socket 信息）
+  return "unknown";
+}
+
+/**
+ * 检查 IP 是否被锁定
+ */
+function checkIPLocked(ip: string): { locked: boolean; remainingTime?: number } {
+  const record = loginAttempts.get(ip);
+  if (!record) {
+    return { locked: false };
+  }
+
+  const now = Date.now();
+  if (record.lockedUntil > now) {
+    return {
+      locked: true,
+      remainingTime: Math.ceil((record.lockedUntil - now) / 1000)  // 秒
+    };
+  }
+
+  // 锁定已过期，清除记录
+  loginAttempts.delete(ip);
+  return { locked: false };
+}
+
+/**
+ * 记录登录失败
+ */
+function recordLoginFailure(ip: string): void {
+  const record = loginAttempts.get(ip) || { attempts: 0, lockedUntil: 0 };
+  record.attempts++;
+
+  if (record.attempts >= MAX_LOGIN_ATTEMPTS) {
+    record.lockedUntil = Date.now() + LOGIN_LOCK_DURATION;
+    console.log(`🔒 IP ${ip} 已被锁定 ${LOGIN_LOCK_DURATION / 60000} 分钟（失败 ${record.attempts} 次）`);
+  }
+
+  loginAttempts.set(ip, record);
+}
+
+/**
+ * 清除登录失败记录
+ */
+function clearLoginFailure(ip: string): void {
+  loginAttempts.delete(ip);
 }
 
 // 注册配置（可动态调整）
@@ -870,7 +939,21 @@ const LOGIN_PAGE = `<!DOCTYPE html>
                     document.cookie = 'sessionId=' + result.sessionId + '; path=/; max-age=86400';
                     window.location.href = '/';
                 } else {
-                    errorMsg.textContent = result.error || '登录失败';
+                    // 显示错误信息
+                    let errorText = result.error || '登录失败';
+
+                    // 如果账号被锁定，显示剩余时间
+                    if (result.code === 'ACCOUNT_LOCKED' && result.remainingTime) {
+                        const minutes = Math.floor(result.remainingTime / 60);
+                        const seconds = result.remainingTime % 60;
+                        errorText += ' (' + minutes + '分' + seconds + '秒后可重试)';
+                    }
+                    // 如果有剩余尝试次数，显示提示
+                    else if (result.attemptsRemaining !== undefined) {
+                        errorText += ' (剩余 ' + result.attemptsRemaining + ' 次尝试机会)';
+                    }
+
+                    errorMsg.textContent = errorText;
                     errorMsg.classList.remove('hidden');
                 }
             } catch (error) {
@@ -1836,19 +1919,49 @@ async function handler(req: Request): Promise<Response> {
 
   // 登录 API（无需鉴权）
   if (url.pathname === "/api/login" && req.method === "POST") {
+    const clientIP = getClientIP(req);
+
+    // 检查 IP 是否被锁定
+    const lockCheck = checkIPLocked(clientIP);
+    if (lockCheck.locked) {
+      console.log(`🚫 IP ${clientIP} 尝试登录但已被锁定，剩余 ${lockCheck.remainingTime} 秒`);
+      return new Response(JSON.stringify({
+        success: false,
+        error: `登录失败次数过多，账号已被锁定`,
+        remainingTime: lockCheck.remainingTime,
+        code: "ACCOUNT_LOCKED"
+      }), {
+        status: 429,  // Too Many Requests
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
     const body = await req.json();
     if (body.username === AUTH_USERNAME && body.password === AUTH_PASSWORD) {
+      // 登录成功，清除失败记录
+      clearLoginFailure(clientIP);
       const sessionId = generateSessionId();
 
       // 保存 session 到 KV，设置 24 小时过期
       const sessionKey = ["sessions", sessionId];
       await kv.set(sessionKey, { createdAt: Date.now() }, { expireIn: 86400000 }); // 24小时过期
 
+      console.log(`✅ IP ${clientIP} 登录成功`);
       return new Response(JSON.stringify({ success: true, sessionId }), {
         headers: { "Content-Type": "application/json" }
       });
     }
-    return new Response(JSON.stringify({ success: false, error: "用户名或密码错误" }), {
+
+    // 登录失败，记录失败次数
+    recordLoginFailure(clientIP);
+    const attempts = loginAttempts.get(clientIP)?.attempts || 0;
+    console.log(`❌ IP ${clientIP} 登录失败（第 ${attempts} 次）`);
+
+    return new Response(JSON.stringify({
+      success: false,
+      error: "用户名或密码错误",
+      attemptsRemaining: Math.max(0, MAX_LOGIN_ATTEMPTS - attempts)
+    }), {
       status: 401,
       headers: { "Content-Type": "application/json" }
     });
@@ -1857,10 +1970,26 @@ async function handler(req: Request): Promise<Response> {
   // 鉴权检查（其他所有路径都需要验证）
   const auth = await checkAuth(req);
   if (!auth.authenticated) {
-    return new Response(null, {
-      status: 302,
-      headers: { "Location": "/login" }
-    });
+    // 判断是 API 请求还是页面请求
+    const isApiRequest = url.pathname.startsWith('/api/');
+
+    if (isApiRequest) {
+      // API 请求返回 401 JSON 响应
+      return new Response(JSON.stringify({
+        success: false,
+        error: "未授权访问，请先登录",
+        code: "UNAUTHORIZED"
+      }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" }
+      });
+    } else {
+      // 页面请求返回 302 重定向
+      return new Response(null, {
+        status: 302,
+        headers: { "Location": "/login" }
+      });
+    }
   }
 
   // 登出 API
