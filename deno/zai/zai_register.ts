@@ -2234,17 +2234,27 @@ const HTML_PAGE = `<!DOCTYPE html>
                 const result = await response.json();
 
                 if (response.ok && result.success) {
-                    // 更新本地账号状态为已同步
+                    // 同步成功后删除本地已同步的账号
                     const transaction = db.transaction([STORE_NAME], 'readwrite');
                     const store = transaction.objectStore(STORE_NAME);
+                    const emailIndex = store.index('email');
 
+                    let deleted = 0;
                     for (const acc of localOnly) {
-                        acc.source = 'synced';
-                        store.put(acc);
+                        const request = emailIndex.getKey(acc.email);
+                        request.onsuccess = () => {
+                            if (request.result) {
+                                store.delete(request.result);
+                                deleted++;
+                            }
+                        };
                     }
 
-                    await loadLocalAccounts();
-                    showToast(\`同步成功！已同步 \${result.synced} 个账号\`, 'success');
+                    // 等待删除完成
+                    transaction.oncomplete = async () => {
+                        await loadLocalAccounts();
+                        showToast(\`同步成功！已同步 \${result.synced} 个账号，已删除 \${deleted} 个本地记录\`, 'success');
+                    };
                 } else {
                     showToast(result.error || '同步失败', 'error');
                 }
@@ -2306,14 +2316,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                         filteredAccounts = accounts;
                         $totalAccounts.text(accounts.length);
                         renderTable();
-
-                        // 同时保存到IndexedDB作为本地备份（标记为kv来源）
-                        if (data.account.source !== 'local') {
-                            data.account.source = 'kv'; // 标记为来自KV的账号
-                            saveToLocal(data.account).catch(err => {
-                                console.warn('保存到本地备份失败:', err);
-                            });
-                        }
+                        // KV账号不需要保存到IndexedDB（已在服务器，无需本地备份）
                         break;
                     case 'local_account_added':
                         // KV保存失败，仅保存到IndexedDB
