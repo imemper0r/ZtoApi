@@ -517,15 +517,32 @@ async function createApiKey(accessToken: string, orgId: string, projectId: strin
 }
 
 async function saveAccount(email: string, password: string, token: string, apikey?: string): Promise<void> {
-  const timestamp = Date.now();
-  const key = ["zai_accounts", timestamp, email];
-  await kv.set(key, {
-    email,
-    password,
-    token,
-    apikey: apikey || null,  // 新增 APIKEY 字段
-    createdAt: new Date().toISOString()
-  });
+  try {
+    const timestamp = Date.now();
+    const key = ["zai_accounts", timestamp, email];
+    await kv.set(key, {
+      email,
+      password,
+      token,
+      apikey: apikey || null,  // 新增 APIKEY 字段
+      createdAt: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error("❌ Failed to save account to KV:", error);
+
+    // Check if it's a quota exhausted error
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    if (errorMessage.includes("quota is exhausted")) {
+      broadcast({
+        type: 'log',
+        level: 'error',
+        message: `❌ KV 存储配额已耗尽，无法保存账号 ${email}`
+      });
+      throw new Error("KV quota exhausted");
+    }
+
+    throw error; // Re-throw other errors
+  }
 }
 
 interface RegisterResult {
@@ -1962,7 +1979,31 @@ async function handler(req: Request): Promise<Response> {
 
       // 保存 session 到 KV，设置 24 小时过期
       const sessionKey = ["sessions", sessionId];
-      await kv.set(sessionKey, { createdAt: Date.now() }, { expireIn: 86400000 }); // 24小时过期
+      try {
+        await kv.set(sessionKey, { createdAt: Date.now() }, { expireIn: 86400000 }); // 24小时过期
+      } catch (error) {
+        console.error("❌ Failed to save session to KV:", error);
+
+        // Check if it's a quota exhausted error
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        if (errorMessage.includes("quota is exhausted")) {
+          return new Response(JSON.stringify({
+            success: false,
+            error: "KV 存储配额已耗尽，请清理数据或升级配额"
+          }), {
+            status: 507, // Insufficient Storage
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+
+        return new Response(JSON.stringify({
+          success: false,
+          error: "登录失败: 无法保存会话"
+        }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
 
       console.log(`✅ IP ${clientIP} 登录成功`);
       return new Response(JSON.stringify({ success: true, sessionId }), {
@@ -2146,13 +2187,27 @@ async function handler(req: Request): Promise<Response> {
       // 保存到 KV
       const timestamp = Date.now();
       const key = ["zai_accounts", timestamp, email];
-      await kv.set(key, {
-        email,
-        password,
-        token,
-        apikey: apikey || null,  // 支持APIKEY字段
-        createdAt: new Date().toISOString()
-      });
+      try {
+        await kv.set(key, {
+          email,
+          password,
+          token,
+          apikey: apikey || null,  // 支持APIKEY字段
+          createdAt: new Date().toISOString()
+        });
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        if (errorMessage.includes("quota is exhausted")) {
+          return new Response(JSON.stringify({
+            success: false,
+            error: "KV 存储配额已耗尽，无法导入账号"
+          }), {
+            status: 507,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+        throw error;
+      }
 
       return new Response(JSON.stringify({ success: true }), {
         headers: { "Content-Type": "application/json" }
@@ -2190,6 +2245,7 @@ async function handler(req: Request): Promise<Response> {
       // 批量写入（去重）
       let imported = 0;
       let skipped = 0;
+      let quotaExhausted = false;
       const timestamp = Date.now();
 
       for (const [index, acc] of importAccounts.entries()) {
@@ -2208,16 +2264,40 @@ async function handler(req: Request): Promise<Response> {
 
         // 使用不同的时间戳避免键冲突
         const key = ["zai_accounts", timestamp + index, email];
-        await kv.set(key, {
-          email,
-          password,
-          token,
-          apikey: apikey || null,  // 支持APIKEY字段
-          createdAt: new Date().toISOString()
-        });
+        try {
+          await kv.set(key, {
+            email,
+            password,
+            token,
+            apikey: apikey || null,  // 支持APIKEY字段
+            createdAt: new Date().toISOString()
+          });
 
-        existingEmails.add(email);
-        imported++;
+          existingEmails.add(email);
+          imported++;
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          if (errorMessage.includes("quota is exhausted")) {
+            console.error("❌ KV quota exhausted during batch import");
+            quotaExhausted = true;
+            break; // Stop importing if quota is exhausted
+          }
+          // Log other errors but continue
+          console.error(`Failed to import account ${email}:`, error);
+          skipped++;
+        }
+      }
+
+      if (quotaExhausted) {
+        return new Response(JSON.stringify({
+          success: false,
+          imported,
+          skipped: skipped + (importAccounts.length - imported - skipped),
+          error: "KV 存储配额已耗尽，已导入 " + imported + " 个账号"
+        }), {
+          status: 507,
+          headers: { "Content-Type": "application/json" }
+        });
       }
 
       return new Response(JSON.stringify({ success: true, imported, skipped }), {

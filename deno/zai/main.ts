@@ -3023,7 +3023,7 @@ const apiDocsHTML = `<!DOCTYPE html>
             <h2 class="text-2xl font-bold text-gray-900 mb-4">🔐 身份验证</h2>
             <p class="text-gray-700 mb-4">所有 API 请求都需要在请求头中包含 Bearer Token：</p>
             <div class="bg-gray-900 rounded-lg p-4 overflow-x-auto">
-                <code class="text-green-400 font-mono text-sm">Authorization: Bearer ${DEFAULT_KEY}</code>
+                <code class="text-green-400 font-mono text-sm">Authorization: Bearer $你设置的 DEFAULT_KEY</code>
             </div>
         </div>
 
@@ -3038,7 +3038,7 @@ const apiDocsHTML = `<!DOCTYPE html>
                 <p class="text-gray-700 mb-3">获取可用模型列表</p>
                 <div class="bg-gray-900 rounded-lg p-4 overflow-x-auto">
                     <pre class="text-green-400 font-mono text-sm">curl https://zto2api.deno.dev/v1/models \\
-  -H "Authorization: Bearer ${DEFAULT_KEY}"</pre>
+  -H "Authorization: Bearer $你设置的 DEFAULT_KEY"</pre>
                 </div>
             </div>
 
@@ -3075,7 +3075,7 @@ const apiDocsHTML = `<!DOCTYPE html>
                 <div class="bg-gray-900 rounded-lg p-4 overflow-x-auto">
                     <pre class="text-green-400 font-mono text-sm">curl -X POST https://zto2api.deno.dev/v1/chat/completions \\
   -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer ${DEFAULT_KEY}" \\
+  -H "Authorization: Bearer $你设置的 DEFAULT_KEY" \\
   -d '{
     "model": "${MODEL_NAME}",
     "messages": [
@@ -3093,7 +3093,7 @@ const apiDocsHTML = `<!DOCTYPE html>
                 <pre class="text-green-400 font-mono text-sm">import openai
 
 client = openai.OpenAI(
-    api_key="${DEFAULT_KEY}",
+    api_key="$你设置的 DEFAULT_KEY",
     base_url="https://zto2api.deno.dev/v1"
 )
 
