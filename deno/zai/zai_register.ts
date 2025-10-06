@@ -516,7 +516,20 @@ async function createApiKey(accessToken: string, orgId: string, projectId: strin
   }
 }
 
-async function saveAccount(email: string, password: string, token: string, apikey?: string): Promise<boolean> {
+/**
+ * 检查账号Token是否有效
+ * 通过尝试登录API来验证token
+ */
+async function checkAccountStatus(token: string): Promise<boolean> {
+  try {
+    const accessToken = await loginToApi(token);
+    return accessToken !== null;
+  } catch (error) {
+    return false;
+  }
+}
+
+async function saveAccount(email: string, password: string, token: string, apikey?: string, status: string = 'active'): Promise<boolean> {
   try {
     const timestamp = Date.now();
     const key = ["zai_accounts", timestamp, email];
@@ -525,6 +538,7 @@ async function saveAccount(email: string, password: string, token: string, apike
       password,
       token,
       apikey: apikey || null,  // 新增 APIKEY 字段
+      status: status,  // 账号状态: active/inactive
       createdAt: new Date().toISOString()
     });
     return true; // 保存成功
@@ -1427,6 +1441,17 @@ const HTML_PAGE = `<!DOCTYPE html>
                         🔑 批量补充APIKEY
                     </button>
 
+                    <!-- 存活性检测 -->
+                    <button id="batchCheckAccountsBtn"
+                        class="flex-1 sm:flex-none px-3 sm:px-4 py-2 bg-gradient-to-r from-yellow-500 to-orange-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-xs sm:text-sm whitespace-nowrap">
+                        🔍 批量检测存活
+                    </button>
+
+                    <button id="deleteInactiveBtn"
+                        class="flex-1 sm:flex-none px-3 sm:px-4 py-2 bg-gradient-to-r from-red-500 to-pink-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-xs sm:text-sm whitespace-nowrap">
+                        🗑️ 删除失效账号
+                    </button>
+
                     <button id="refreshBtn"
                         class="flex-1 sm:flex-none px-3 sm:px-4 py-2 bg-gradient-to-r from-blue-500 to-indigo-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-xs sm:text-sm whitespace-nowrap">
                         🔃 刷新
@@ -1443,6 +1468,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                             <th class="px-2 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm font-semibold text-gray-700 hide-mobile">Token</th>
                             <th class="px-2 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm font-semibold text-gray-700 hide-mobile">APIKEY</th>
                             <th class="px-2 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm font-semibold text-gray-700 hide-mobile">创建时间</th>
+                            <th class="px-2 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm font-semibold text-gray-700">状态</th>
                             <th class="px-2 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm font-semibold text-gray-700">操作</th>
                         </tr>
                     </thead>
@@ -1626,7 +1652,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             const pageData = displayData.slice(startIndex, endIndex);
 
             if (pageData.length === 0) {
-                $accountTableBody.html('<tr><td colspan="7" class="px-4 py-8 text-center text-gray-400">暂无数据</td></tr>');
+                $accountTableBody.html('<tr><td colspan="8" class="px-4 py-8 text-center text-gray-400">暂无数据</td></tr>');
             } else {
                 const rows = pageData.map((acc, idx) => {
                     const rowId = 'row-' + (startIndex + idx);
@@ -1635,6 +1661,12 @@ const HTML_PAGE = `<!DOCTYPE html>
                         '<code class="bg-indigo-50 text-indigo-700 px-2 py-1 rounded text-xs font-mono">' + acc.apikey.substring(0, 20) + '...</code>' :
                         '<span class="text-gray-400 text-xs italic">未生成</span>';
 
+                    // 处理状态显示
+                    const status = acc.status || 'active';
+                    const statusDisplay = status === 'active' ?
+                        '<span class="px-2 py-1 bg-green-100 text-green-700 rounded-full text-xs font-medium">✓ 正常</span>' :
+                        '<span class="px-2 py-1 bg-red-100 text-red-700 rounded-full text-xs font-medium">✗ 失效</span>';
+
                     return '<tr class="group" id="' + rowId + '">' +
                         '<td class="px-2 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm text-gray-700 font-medium">' + (startIndex + idx + 1) + '</td>' +
                         '<td class="px-2 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm text-gray-700 truncate max-w-[200px] clickable-cell" title="点击复制: ' + acc.email + '" data-copy="' + acc.email + '">' + acc.email + '</td>' +
@@ -1642,6 +1674,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                         '<td class="px-2 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm text-gray-700 hide-mobile clickable-cell" title="点击复制Token" data-copy="' + acc.token + '"><code class="bg-green-50 text-green-700 px-2 py-1 rounded text-xs font-mono">' + acc.token.substring(0, 20) + '...</code></td>' +
                         '<td class="px-2 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm text-gray-700 hide-mobile' + (acc.apikey ? ' clickable-cell' : '') + '"' + (acc.apikey ? ' title="点击复制APIKEY" data-copy="' + acc.apikey + '"' : '') + '>' + apikeyDisplay + '</td>' +
                         '<td class="px-2 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm text-gray-700 hide-mobile">' + new Date(acc.createdAt).toLocaleString('zh-CN') + '</td>' +
+                        '<td class="px-2 sm:px-4 py-2 sm:py-3 text-center">' + statusDisplay + '</td>' +
                         '<td class="px-2 sm:px-4 py-2 sm:py-3"><div class="flex gap-1 sm:gap-2 flex-wrap">' +
                             '<button class="copy-full-btn action-btn text-indigo-600 hover:text-indigo-800 text-xs sm:text-sm font-medium whitespace-nowrap" ' +
                             'data-email="' + acc.email + '" ' +
@@ -1985,6 +2018,10 @@ const HTML_PAGE = `<!DOCTYPE html>
         $('#syncToServerBtn').on('click', syncLocalToServer);
 
         $('#batchRefetchApikeyBtn').on('click', batchRefetchApikey);
+
+        $('#batchCheckAccountsBtn').on('click', batchCheckAccounts);
+
+        $('#deleteInactiveBtn').on('click', deleteInactiveAccounts);
 
         $startRegisterBtn.on('click', async function() {
             try {
@@ -2380,6 +2417,82 @@ const HTML_PAGE = `<!DOCTYPE html>
 
             showToast('批量获取完成！成功 ' + successCount + ' 个，失败 ' + failedCount + ' 个',
                       successCount > 0 ? 'success' : 'error');
+        }
+
+        // 批量检测账号存活性
+        async function batchCheckAccounts() {
+            if (accounts.length === 0) {
+                showToast('暂无账号需要检测', 'info');
+                return;
+            }
+
+            if (!confirm('确定要检测所有账号的存活性吗？这可能需要一些时间。')) {
+                return;
+            }
+
+            const emails = accounts.map(acc => acc.email);
+            showToast('开始批量检测，共 ' + emails.length + ' 个账号...', 'info');
+            addLog('开始批量检测账号存活性...', 'info');
+
+            try {
+                const response = await fetch('/api/check-accounts', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ emails: emails })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    const activeCount = result.results.filter(r => r.isActive).length;
+                    const inactiveCount = result.results.filter(r => !r.isActive).length;
+
+                    addLog('检测完成！正常: ' + activeCount + ' 个，失效: ' + inactiveCount + ' 个', 'success');
+                    showToast('检测完成！正常: ' + activeCount + ' 个，失效: ' + inactiveCount + ' 个', 'success');
+
+                    // 刷新账号列表
+                    await loadAccounts();
+                } else {
+                    showToast('检测失败: ' + result.error, 'error');
+                }
+            } catch (error) {
+                console.error('批量检测失败:', error);
+                showToast('批量检测失败: ' + error.message, 'error');
+            }
+        }
+
+        // 删除失效账号
+        async function deleteInactiveAccounts() {
+            const inactiveCount = accounts.filter(acc => acc.status === 'inactive').length;
+
+            if (inactiveCount === 0) {
+                showToast('没有失效账号需要删除', 'info');
+                return;
+            }
+
+            if (!confirm('发现 ' + inactiveCount + ' 个失效账号，确定要删除吗？此操作不可恢复！')) {
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/delete-inactive', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    showToast('成功删除 ' + result.deleted + ' 个失效账号', 'success');
+                    addLog('成功删除 ' + result.deleted + ' 个失效账号', 'success');
+                    await loadAccounts();
+                } else {
+                    showToast('删除失败: ' + result.error, 'error');
+                }
+            } catch (error) {
+                console.error('删除失效账号失败:', error);
+                showToast('删除失败: ' + error.message, 'error');
+            }
         }
 
         function connectSSE() {
@@ -3023,6 +3136,95 @@ async function handler(req: Request): Promise<Response> {
       return new Response(JSON.stringify({
         success: true,
         apikey: apikey
+      }), {
+        headers: { "Content-Type": "application/json" }
+      });
+
+    } catch (error: any) {
+      return new Response(JSON.stringify({
+        success: false,
+        error: "请求错误: " + error?.message
+      }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  }
+
+  // 批量检测账号存活性
+  if (url.pathname === "/api/check-accounts" && req.method === "POST") {
+    try {
+      const body = await req.json();
+      const { emails } = body;
+
+      if (!emails || !Array.isArray(emails)) {
+        return new Response(JSON.stringify({
+          success: false,
+          error: "缺少必需参数: emails"
+        }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+
+      const results: any[] = [];
+      const entries = kv.list({ prefix: ["zai_accounts"] });
+
+      for await (const entry of entries) {
+        const account = entry.value as any;
+        if (emails.includes(account.email)) {
+          const isActive = await checkAccountStatus(account.token);
+          const newStatus = isActive ? 'active' : 'inactive';
+
+          // 更新账号状态
+          await kv.set(entry.key, {
+            ...account,
+            status: newStatus
+          });
+
+          results.push({
+            email: account.email,
+            status: newStatus,
+            isActive: isActive
+          });
+        }
+      }
+
+      return new Response(JSON.stringify({
+        success: true,
+        results: results
+      }), {
+        headers: { "Content-Type": "application/json" }
+      });
+
+    } catch (error: any) {
+      return new Response(JSON.stringify({
+        success: false,
+        error: "请求错误: " + error?.message
+      }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  }
+
+  // 删除失效账号
+  if (url.pathname === "/api/delete-inactive" && req.method === "POST") {
+    try {
+      let deletedCount = 0;
+      const entries = kv.list({ prefix: ["zai_accounts"] });
+
+      for await (const entry of entries) {
+        const account = entry.value as any;
+        if (account.status === 'inactive') {
+          await kv.delete(entry.key);
+          deletedCount++;
+        }
+      }
+
+      return new Response(JSON.stringify({
+        success: true,
+        deleted: deletedCount
       }), {
         headers: { "Content-Type": "application/json" }
       });
