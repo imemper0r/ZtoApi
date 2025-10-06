@@ -27,29 +27,12 @@ const AUTH_USERNAME = Deno.env.get("ZAI_USERNAME") || "admin";
 const AUTH_PASSWORD = Deno.env.get("ZAI_PASSWORD") || "123456";
 
 // 邮箱域名列表 - 用于生成随机临时邮箱
-// 这些域名来自 mail.chatgpt.org.uk 的临时邮箱服务
 const DOMAINS = [
-  "14club.org.uk", "29thnewport.org.uk", "2ndwhartonscoutgroup.org.uk",
-  "3littlemiracles.com", "aard.org.uk", "abrahampath.org.uk",
-  "aiccministry.com", "allumhall.co.uk", "almiswelfare.org",
-  "amyfalconer.co.uk", "avarthanas.org", "aylshamrotary.club",
-  "bbfcharity.org", "birdsedgevillagehall.co.uk", "bodyofchristministries.co.uk",
-  "bp-hall.co.uk", "brendansbridge.org.uk", "brentwoodmdc.org",
-  "cade.org.uk", "caye.org.uk", "cccnoahsark.com", "cccvojc.org",
-  "cementingfutures.org", "cephastrust.org", "chatgptuk.pp.ua",
-  "christchurchandstgeorges.org", "christchurchsouthend.org.uk",
-  "cketrust.org", "club106.org.uk", "cockertonmethodist.org.uk",
-  "cok.org.uk", "counsellingit.org", "cumnorthampton.org", "cwetg.co.uk",
-  "dormerhouseschool.co.uk", "dpmcharity.org", "e-quiparts.org.uk",
-  "eapn-england.org", "educationossett.co.uk", "egremonttrust.org.uk",
-  "email.gravityengine.cc", "engagefordevelopment.org", "f4jobseekers.org.uk",
-  "flushingvillageclub.org.uk", "fordslane.org.uk", "freemails.pp.ua",
-  "friendsofkms.org.uk", "gadshillplace.com", "goleudy.org.uk",
-  "gospelassembly.org.uk", "gospelgeneration.org.uk", "gracesanctuary-rccg.co.uk",
-  "gravityengine.cc", "greyhoundwalks.org.uk", "gyan-netra.com",
-  "haslemerecfr.org.uk", "hfh4elderly.org", "hhe.org.uk",
-  "hottchurch.org.uk", "huddsdeafcentre.org", "hvcrc.org",
-  "ingrambreamishvalley.co.uk", "iqraacademy.org.uk", "iraniandsa.org"
+  "chatgptuk.pp.ua", "freemails.pp.ua", "email.gravityengine.cc", "gravityengine.cc",
+  "3littlemiracles.com", "almiswelfare.org", "gyan-netra.com", "iraniandsa.org",
+  "14club.org.uk", "aard.org.uk", "allumhall.co.uk", "cade.org.uk",
+  "caye.org.uk", "cketrust.org", "club106.org.uk", "cok.org.uk",
+  "cwetg.co.uk", "goleudy.org.uk", "hhe.org.uk", "hottchurch.org.uk"
 ];
 
 // ==================== 数据存储 ====================
