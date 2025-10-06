@@ -575,6 +575,25 @@ async function cleanupOldData() {
         debugLog("Deleted old daily data:", date);
       }
     }
+
+    // Cleanup expired admin sessions (older than 24 hours)
+    // Note: Sessions have expireIn set, but we manually cleanup to free quota
+    const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    const sessionPrefix = ["admin_sessions"];
+    const sessionEntries = kv.list({ prefix: sessionPrefix });
+
+    let cleanedSessions = 0;
+    for await (const entry of sessionEntries) {
+      const sessionData = entry.value as { createdAt: number };
+      if (sessionData.createdAt < oneDayAgo) {
+        await kv.delete(entry.key);
+        cleanedSessions++;
+      }
+    }
+
+    if (cleanedSessions > 0) {
+      debugLog(`Cleaned up ${cleanedSessions} expired session(s)`);
+    }
   } catch (error) {
     debugLog("Error cleaning up old data:", error);
   }
@@ -4013,6 +4032,19 @@ async function handler(req: Request): Promise<Response> {
             await kv.set(sessionKey, { createdAt: Date.now() }, { expireIn: 86400000 }); // 24 hours
           } catch (error) {
             console.error("❌ Failed to save session to KV:", error);
+
+            // Check if it's a quota exhausted error
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            if (errorMessage.includes("quota is exhausted")) {
+              return new Response(JSON.stringify({
+                success: false,
+                error: "KV 存储配额已耗尽，请联系管理员清理数据或升级配额"
+              }), {
+                status: 507, // Insufficient Storage
+                headers: { "Content-Type": "application/json" }
+              });
+            }
+
             return new Response(JSON.stringify({
               success: false,
               error: "登录失败: 无法保存会话"
@@ -4208,6 +4240,12 @@ if (ADMIN_ENABLED && !kv) {
   console.warn("   - Account management will NOT work");
   console.warn("   - Playground will NOT be accessible");
   console.warn("   Please run with: deno run --allow-net --allow-env --allow-read --unstable-kv main.ts");
+}
+
+// Cleanup old data on startup to free KV quota
+if (kv) {
+  await cleanupOldData();
+  console.log("✓ Initial data cleanup completed");
 }
 
 // Schedule daily stats aggregation and cleanup (runs every hour)
