@@ -1751,16 +1751,20 @@ const HTML_PAGE = `<!DOCTYPE html>
 
                 for (const line of lines) {
                     const parts = line.split('----');
-                    let email, password, token;
+                    let email, password, token, apikey;
 
                     if (parts.length >= 4) {
-                        email = parts[0].trim();
-                        password = parts[1].trim();
-                        token = parts[2].trim() + '----' + parts[3].trim();
-                    } else if (parts.length === 3) {
+                        // 四字段格式：账号----密码----Token----APIKEY
                         email = parts[0].trim();
                         password = parts[1].trim();
                         token = parts[2].trim();
+                        apikey = parts[3].trim() || null;
+                    } else if (parts.length === 3) {
+                        // 三字段格式（旧格式）：账号----密码----Token
+                        email = parts[0].trim();
+                        password = parts[1].trim();
+                        token = parts[2].trim();
+                        apikey = null;
                     } else {
                         continue;
                     }
@@ -1768,7 +1772,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                     // 去重检查
                     if (!emailSet.has(email)) {
                         emailSet.add(email);
-                        importData.push({ email, password, token });
+                        importData.push({ email, password, token, apikey });
                     }
                 }
 

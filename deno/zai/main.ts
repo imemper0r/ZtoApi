@@ -2118,9 +2118,9 @@ const playgroundHTML = `<!DOCTYPE html>
                 <!-- API Key -->
                 <div class="mb-4">
                     <label class="block text-sm font-medium text-gray-700 mb-2">API Key</label>
-                    <input type="text" id="apiKey" value="${DEFAULT_KEY}"
+                    <input type="text" id="apiKey" value=""
                            class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent"
-                           placeholder="sk-your-key">
+                           placeholder="请输入你的 API Key (例如: sk-your-key)">
                 </div>
 
                 <!-- ZAI Token (Optional) -->
@@ -3303,10 +3303,6 @@ const adminLoginHTML = `<!DOCTYPE html>
                 登录
             </button>
         </form>
-
-        <div class="mt-6 text-center text-sm text-gray-500">
-            <p>默认账号: ${ADMIN_USERNAME} / ${ADMIN_PASSWORD}</p>
-        </div>
     </div>
 
     <script>
@@ -3891,6 +3887,15 @@ async function handler(req: Request): Promise<Response> {
   }
 
   if (path === "/playground" && req.method === "GET") {
+    // Require authentication for playground
+    const auth = await checkAuth(req);
+    if (!auth.authenticated) {
+      return new Response(null, {
+        status: 302,
+        headers: { "Location": "/admin/login" }
+      });
+    }
+
     return new Response(playgroundHTML, {
       status: 200,
       headers: { "Content-Type": "text/html; charset=utf-8" },

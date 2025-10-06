@@ -202,9 +202,8 @@ email----password----token----
 ```
 
 **支持导入格式**：
-1. 五段格式（带分隔符的 APIKEY）：`email----password----token_part1----token_part2----apikey`
-2. 四段格式（标准）：`email----password----token----apikey`
-3. 三段格式（旧版）：`email----password----token`
+1. 四字段格式（标准，包含 APIKEY）：`email----password----token----apikey`
+2. 三字段格式（旧版，不含 APIKEY）：`email----password----token`
 
 批量导入时会自动去重（以邮箱为唯一键）。
 

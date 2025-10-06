@@ -50,15 +50,18 @@ deno task start
 
 **TXT 文件格式要求**：
 ```
+# 四字段格式（标准，包含 APIKEY）
+email----password----token----apikey
+
+# 三字段格式（旧版，不含 APIKEY）
 email----password----token
-email----password----token----extrapart
 ```
 
 示例：
 ```
-test1@example.com----password123----eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.testtoken1
-test2@example.com----password456----eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.testtoken2
-test3@example.com----password789----eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.testtoken3----extrapart
+test1@example.com----password123----eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.testtoken1----sk-apikey1
+test2@example.com----password456----eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.testtoken2----sk-apikey2
+test3@example.com----password789----eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.testtoken3----
 ```
 
 **导入步骤**：
@@ -134,6 +137,7 @@ Cookie: adminSessionId=session_id
     "email": "test@example.com",
     "password": "password123",
     "token": "eyJhbGci...",
+    "apikey": "sk-apikey123",
     "createdAt": "2025-01-01T00:00:00.000Z"
   }
 ]
@@ -151,7 +155,8 @@ Content-Type: application/json
     {
       "email": "test@example.com",
       "password": "password123",
-      "token": "token_string"
+      "token": "token_string",
+      "apikey": "sk-apikey123"
     }
   ]
 }
@@ -173,7 +178,7 @@ GET /admin/api/export
 Cookie: adminSessionId=session_id
 ```
 
-返回 TXT 文件（格式：`email----password----token`）
+返回 TXT 文件（格式：`email----password----token----apikey`）
 
 ### 登出 API
 
@@ -204,17 +209,23 @@ Cookie: adminSessionId=session_id
    export ADMIN_PASSWORD=your_strong_password
    ```
 
-2. **禁用管理面板**（如不需要）：
+   ⚠️ **注意**：登录页面已移除默认密码显示，确保生产环境安全。
+
+2. **Playground 访问控制**：
+   - `/playground` 页面需要管理员登录后才能访问
+   - 未登录用户会自动重定向到登录页面
+
+3. **禁用管理面板**（如不需要）：
    ```bash
    export ADMIN_ENABLED=false
    ```
 
-3. **Session 管理**：
+4. **Session 管理**：
    - 使用 Cookie 存储 Session ID
    - Session 数据存储在 KV 中，24 小时过期
    - 登出后 Session 立即失效
 
-4. **访问控制**：
+5. **访问控制**：
    - 所有 `/admin/api/*` 接口（除登录外）需要鉴权
    - 未登录访问会返回 401 或重定向到登录页
 
@@ -248,7 +259,8 @@ deno run --allow-net --allow-env --allow-read --unstable-kv main.ts
 检查 TXT 文件格式：
 - 每行一个账号
 - 使用 `----` 分隔字段
-- 至少包含 `email----password----token`
+- 四字段格式：`email----password----token----apikey`（APIKEY 可为空）
+- 三字段格式：`email----password----token`（旧格式兼容）
 
 ### 问题4：Session 失效
 - Session 默认 24 小时过期
