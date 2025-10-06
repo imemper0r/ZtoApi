@@ -699,7 +699,17 @@ async function registerAccount(): Promise<RegisterResult> {
     const accessToken = await loginToApi(userToken);
     if (!accessToken) {
       // 即使API登录失败，也保存账号（只有Token，没有APIKEY）
-      await saveAccount(email, password, userToken);
+      try {
+        await saveAccount(email, password, userToken);
+      } catch (error) {
+        // 如果KV配额耗尽，只广播错误但不中断流程
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        if (errorMessage.includes("KV quota exhausted")) {
+          broadcast({ type: 'log', level: 'error', message: `⚠️ KV配额已耗尽，账号未保存到KV: ${email}` });
+        } else {
+          throw error; // 其他错误继续抛出
+        }
+      }
       stats.success++;
       broadcast({
         type: 'log',
@@ -718,7 +728,17 @@ async function registerAccount(): Promise<RegisterResult> {
     const { orgId, projectId } = await getCustomerInfo(accessToken);
     if (!orgId || !projectId) {
       // 保存账号（只有Token，没有APIKEY）
-      await saveAccount(email, password, userToken);
+      try {
+        await saveAccount(email, password, userToken);
+      } catch (error) {
+        // 如果KV配额耗尽，只广播错误但不中断流程
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        if (errorMessage.includes("KV quota exhausted")) {
+          broadcast({ type: 'log', level: 'error', message: `⚠️ KV配额已耗尽，账号未保存到KV: ${email}` });
+        } else {
+          throw error; // 其他错误继续抛出
+        }
+      }
       stats.success++;
       broadcast({
         type: 'log',
@@ -737,7 +757,17 @@ async function registerAccount(): Promise<RegisterResult> {
     const apiKey = await createApiKey(accessToken, orgId, projectId);
 
     // 9. 保存完整账号信息
-    await saveAccount(email, password, userToken, apiKey || undefined);
+    try {
+      await saveAccount(email, password, userToken, apiKey || undefined);
+    } catch (error) {
+      // 如果KV配额耗尽，只广播错误但不中断流程
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      if (errorMessage.includes("KV quota exhausted")) {
+        broadcast({ type: 'log', level: 'error', message: `⚠️ KV配额已耗尽，账号未保存到KV: ${email}` });
+      } else {
+        throw error; // 其他错误继续抛出
+      }
+    }
     stats.success++;
 
     const account = { email, password, token: userToken, apikey: apiKey || null, createdAt: new Date().toISOString() };
