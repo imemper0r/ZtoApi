@@ -4103,6 +4103,13 @@ async function handler(req: Request): Promise<Response> {
 
     // Admin panel main page
     if (path === "/admin" && req.method === "GET") {
+      const auth = await checkAuth(req);
+      if (!auth.authenticated) {
+        return new Response(null, {
+          status: 302,
+          headers: { "Location": "/admin/login" }
+        });
+      }
       return new Response(adminPanelHTML, {
         status: 200,
         headers: { "Content-Type": "text/html; charset=utf-8" },
