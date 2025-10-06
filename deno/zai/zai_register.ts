@@ -112,10 +112,13 @@ function scheduleSaveLogs() {
  */
 function broadcast(data: any) {
   const message = `data: ${JSON.stringify(data)}\n\n`;
+  console.log(`📤 broadcast: type=${data.type}, sseClients=${sseClients.size}, message=${message.substring(0, 100)}...`);
+
   for (const controller of sseClients) {
     try {
       controller.enqueue(new TextEncoder().encode(message));
-    } catch {
+    } catch (err) {
+      console.log(`⚠️ SSE客户端发送失败，移除连接:`, err);
       sseClients.delete(controller);
     }
   }
@@ -442,7 +445,12 @@ async function saveAccount(email: string, password: string, token: string, apike
   });
 }
 
-async function registerAccount(): Promise<boolean> {
+interface RegisterResult {
+  success: boolean;
+  account?: { email: string; password: string; token: string; apikey: string | null };
+}
+
+async function registerAccount(): Promise<RegisterResult> {
   try {
     const email = createEmail();
     const password = createPassword();
@@ -468,14 +476,14 @@ async function registerAccount(): Promise<boolean> {
     if (signupResponse.status !== 200) {
       broadcast({ type: 'log', level: 'error', message: `  ✗ 注册请求失败: HTTP ${signupResponse.status}` });
       stats.failed++;
-      return false;
+      return { success: false };
     }
 
     const signupResult = await signupResponse.json();
     if (!signupResult.success) {
       broadcast({ type: 'log', level: 'error', message: `  ✗ 注册被拒绝: ${JSON.stringify(signupResult)}` });
       stats.failed++;
-      return false;
+      return { success: false };
     }
 
     broadcast({ type: 'log', level: 'success', message: `  ✓ 注册请求成功` });
@@ -490,7 +498,7 @@ async function registerAccount(): Promise<boolean> {
     const emailContent = await fetchVerificationEmail(email);
     if (!emailContent) {
       stats.failed++;
-      return false;
+      return { success: false };
     }
 
     // 3. 提取验证链接
@@ -541,7 +549,7 @@ async function registerAccount(): Promise<boolean> {
       const preview = emailContent.substring(0, 500).replace(/\n/g, ' ');
       broadcast({ type: 'log', level: 'error', message: `  ✗ 未找到验证链接，邮件预览: ${preview}...` });
       stats.failed++;
-      return false;
+      return { success: false };
     }
 
 
@@ -549,7 +557,7 @@ async function registerAccount(): Promise<boolean> {
     if (!token || !emailFromUrl || !username) {
       broadcast({ type: 'log', level: 'error', message: `  ✗ 验证链接格式错误` });
       stats.failed++;
-      return false;
+      return { success: false };
     }
 
     broadcast({ type: 'log', level: 'success', message: `  ✓ 验证链接已提取` });
@@ -566,14 +574,14 @@ async function registerAccount(): Promise<boolean> {
     if (finishResponse.status !== 200) {
       broadcast({ type: 'log', level: 'error', message: `  ✗ 验证失败: HTTP ${finishResponse.status}` });
       stats.failed++;
-      return false;
+      return { success: false };
     }
 
     const finishResult = await finishResponse.json();
     if (!finishResult.success) {
       broadcast({ type: 'log', level: 'error', message: `  ✗ 验证被拒绝: ${JSON.stringify(finishResult)}` });
       stats.failed++;
-      return false;
+      return { success: false };
     }
 
     // 5. 获取用户Token
@@ -581,7 +589,7 @@ async function registerAccount(): Promise<boolean> {
     if (!userToken) {
       broadcast({ type: 'log', level: 'error', message: `  ✗ 未获取到用户Token` });
       stats.failed++;
-      return false;
+      return { success: false };
     }
 
     broadcast({ type: 'log', level: 'success', message: `  ✓ 获得用户Token` });
@@ -600,8 +608,9 @@ async function registerAccount(): Promise<boolean> {
         stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed },
         link: { text: '查看邮箱', url: emailCheckUrl }
       });
-      broadcast({ type: 'account_added', account: { email, password, token: userToken, apikey: null, createdAt: new Date().toISOString() } });
-      return true;
+      const account = { email, password, token: userToken, apikey: null, createdAt: new Date().toISOString() };
+      broadcast({ type: 'account_added', account });
+      return { success: true, account };
     }
 
     // 7. 获取客户信息
@@ -618,8 +627,9 @@ async function registerAccount(): Promise<boolean> {
         stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed },
         link: { text: '查看邮箱', url: emailCheckUrl }
       });
-      broadcast({ type: 'account_added', account: { email, password, token: userToken, apikey: null, createdAt: new Date().toISOString() } });
-      return true;
+      const account = { email, password, token: userToken, apikey: null, createdAt: new Date().toISOString() };
+      broadcast({ type: 'account_added', account });
+      return { success: true, account };
     }
 
     // 8. 创建API密钥
@@ -630,6 +640,8 @@ async function registerAccount(): Promise<boolean> {
     await saveAccount(email, password, userToken, apiKey || undefined);
     stats.success++;
 
+    const account = { email, password, token: userToken, apikey: apiKey || null, createdAt: new Date().toISOString() };
+
     if (apiKey) {
       broadcast({
         type: 'log',
@@ -638,7 +650,7 @@ async function registerAccount(): Promise<boolean> {
         stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed },
         link: { text: '查看邮箱', url: emailCheckUrl }
       });
-      broadcast({ type: 'account_added', account: { email, password, token: userToken, apikey: apiKey, createdAt: new Date().toISOString() } });
+      broadcast({ type: 'account_added', account });
     } else {
       broadcast({
         type: 'log',
@@ -647,33 +659,38 @@ async function registerAccount(): Promise<boolean> {
         stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed },
         link: { text: '查看邮箱', url: emailCheckUrl }
       });
-      broadcast({ type: 'account_added', account: { email, password, token: userToken, apikey: null, createdAt: new Date().toISOString() } });
+      broadcast({ type: 'account_added', account });
     }
 
-    return true;
+    return { success: true, account };
   } catch (error: any) {
     const msg = error instanceof Error ? error.message : String(error);
     broadcast({ type: 'log', level: 'error', message: `  ✗ 异常: ${msg}` });
     stats.failed++;
-    return false;
+    return { success: false };
   }
 }
 
 async function batchRegister(count: number): Promise<void> {
+  console.log(`🚀 batchRegister 开始，count=${count}, sseClients.size=${sseClients.size}`);
+
   isRunning = true;
   shouldStop = false;
   stats = { success: 0, failed: 0, startTime: Date.now(), lastNotifyTime: Date.now() };
 
+  console.log(`📡 准备广播 'start' 事件...`);
   broadcast({ type: 'start', config: { count } });
+  console.log(`✓ 已广播 'start' 事件`);
 
   const concurrency = registerConfig.concurrency || 1;
   let completed = 0;
+  const successAccounts: Array<{ email: string; password: string; token: string; apikey: string | null }> = [];  // 存储成功注册的账号
 
   // 并发注册
   while (completed < count && !shouldStop) {
     // 计算本批次任务数量
     const batchSize = Math.min(concurrency, count - completed);
-    const batchPromises: Promise<boolean>[] = [];
+    const batchPromises: Promise<RegisterResult>[] = [];
 
     // 创建并发任务
     for (let i = 0; i < batchSize; i++) {
@@ -701,7 +718,15 @@ async function batchRegister(count: number): Promise<void> {
     }
 
     // 等待本批次完成
-    await Promise.allSettled(batchPromises);
+    const results = await Promise.allSettled(batchPromises);
+
+    // 收集成功注册的账号
+    for (const result of results) {
+      if (result.status === 'fulfilled' && result.value.success && result.value.account) {
+        successAccounts.push(result.value.account);
+      }
+    }
+
     completed += batchSize;
 
     // 批次间延迟
@@ -721,10 +746,55 @@ async function batchRegister(count: number): Promise<void> {
     stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed, elapsedTime: elapsedTime.toFixed(1) }
   });
 
+  // 获取总账号数
+  let totalAccounts = 0;
+  try {
+    const entries = kv.list({ prefix: ["zai_accounts"] });
+    for await (const _ of entries) {
+      totalAccounts++;
+    }
+  } catch {
+    // 忽略错误
+  }
+
+  // 构建注册详情列表（最多显示10个）
+  let accountsDetail = '';
+  if (successAccounts.length > 0) {
+    accountsDetail += '\n\n### 📋 注册详情\n';
+    const displayCount = Math.min(successAccounts.length, 10);
+    for (let i = 0; i < displayCount; i++) {
+      const acc = successAccounts[i];
+      accountsDetail += `${i + 1}. **${acc.email}**\n`;
+      accountsDetail += `   - 密码: \`${acc.password}\`\n`;
+      accountsDetail += `   - Token: \`${acc.token.substring(0, 20)}...\`\n`;
+      if (acc.apikey) {
+        accountsDetail += `   - APIKEY: \`${acc.apikey.substring(0, 20)}...\`\n`;
+      }
+    }
+    if (successAccounts.length > displayCount) {
+      accountsDetail += `\n*... 还有 ${successAccounts.length - displayCount} 个账号未显示*\n`;
+    }
+  }
+
   // 发送完成通知
   await sendNotification(
     "✅ Z.AI 注册任务完成",
-    `## ✅ Z.AI 账号注册任务完成\n\n### 执行结果\n- **成功**: ${stats.success} 个\n- **失败**: ${stats.failed} 个\n- **总计**: ${stats.success + stats.failed} 个\n\n### 耗时统计\n- **总耗时**: ${elapsedTime.toFixed(1)} 秒\n- **平均速度**: ${((stats.success + stats.failed) / (elapsedTime / 60)).toFixed(1)} 个/分钟\n\n### 成功率\n- **成功率**: ${stats.success + stats.failed > 0 ? ((stats.success / (stats.success + stats.failed)) * 100).toFixed(1) : 0}%`
+    `## ✅ Z.AI 账号注册任务完成
+
+### 📊 执行结果
+- **成功**: ${stats.success} 个
+- **失败**: ${stats.failed} 个
+- **本次总计**: ${stats.success + stats.failed} 个
+- **账号总数**: ${totalAccounts} 个
+
+### ⏱️ 耗时统计
+- **总耗时**: ${elapsedTime.toFixed(1)} 秒 (${(elapsedTime / 60).toFixed(1)} 分钟)
+- **平均速度**: ${((stats.success + stats.failed) / (elapsedTime / 60)).toFixed(1)} 个/分钟
+- **单个耗时**: ${stats.success + stats.failed > 0 ? (elapsedTime / (stats.success + stats.failed)).toFixed(1) : 0} 秒/个
+
+### 📈 成功率
+- **成功率**: ${stats.success + stats.failed > 0 ? ((stats.success / (stats.success + stats.failed)) * 100).toFixed(1) : 0}%
+- **失败率**: ${stats.success + stats.failed > 0 ? ((stats.failed / (stats.success + stats.failed)) * 100).toFixed(1) : 0}%${accountsDetail}`
   );
 
   isRunning = false;
@@ -1838,9 +1908,11 @@ async function handler(req: Request): Promise<Response> {
 
   // SSE
   if (url.pathname === "/events") {
+    console.log(`🔌 新的 SSE 连接建立，当前客户端数: ${sseClients.size + 1}`);
     const stream = new ReadableStream({
       start(controller) {
         sseClients.add(controller);
+        console.log(`✓ SSE 客户端已添加到连接池，isRunning=${isRunning}`);
         // 发送当前状态
         const message = `data: ${JSON.stringify({ type: 'connected', isRunning })}\n\n`;
         controller.enqueue(new TextEncoder().encode(message));
@@ -2033,7 +2105,13 @@ async function handler(req: Request): Promise<Response> {
 
     const body = await req.json();
     const count = body.count || 5;
-    batchRegister(count);
+
+    // 立即启动任务（不等待完成）
+    batchRegister(count).catch(err => {
+      console.error("注册任务异常:", err);
+      broadcast({ type: 'log', level: 'error', message: `✗ 任务异常: ${err.message}` });
+    });
+
     return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
   }
 
