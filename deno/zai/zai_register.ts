@@ -1128,6 +1128,13 @@ const HTML_PAGE = `<!DOCTYPE html>
             touch-action: manipulation;
         }
 
+        /* 统计卡片选中状态 */
+        .stat-card.active {
+            ring: 4px;
+            ring-color: white;
+            box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.5), 0 10px 25px -5px rgba(0, 0, 0, 0.3);
+        }
+
         /* PC端优化 */
         @media (min-width: 769px) {
             /* 表格悬停效果 */
@@ -1355,13 +1362,13 @@ const HTML_PAGE = `<!DOCTYPE html>
 
         <!-- 统计面板 -->
         <div class="bg-white rounded-2xl shadow-2xl p-3 sm:p-6 mb-4 sm:mb-6">
-            <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-3 sm:mb-4">统计信息</h2>
+            <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-3 sm:mb-4">统计信息 <span class="text-sm text-gray-500 font-normal">(点击切换显示)</span></h2>
             <div class="grid grid-cols-2 md:grid-cols-5 gap-2 sm:gap-4">
-                <div class="bg-gradient-to-br from-green-400 to-emerald-500 rounded-xl p-3 sm:p-4 text-center text-white">
+                <div id="totalAccountsCard" class="stat-card bg-gradient-to-br from-green-400 to-emerald-500 rounded-xl p-3 sm:p-4 text-center text-white cursor-pointer transform transition-all hover:scale-105 active:scale-95">
                     <div class="text-xs sm:text-sm opacity-90 mb-1">总账号</div>
                     <div class="text-2xl sm:text-3xl font-bold" id="totalAccounts">0</div>
                 </div>
-                <div class="bg-gradient-to-br from-cyan-400 to-teal-500 rounded-xl p-3 sm:p-4 text-center text-white">
+                <div id="localAccountsCard" class="stat-card bg-gradient-to-br from-cyan-400 to-teal-500 rounded-xl p-3 sm:p-4 text-center text-white cursor-pointer transform transition-all hover:scale-105 active:scale-95">
                     <div class="text-xs sm:text-sm opacity-90 mb-1">本地账号</div>
                     <div class="text-2xl sm:text-3xl font-bold" id="localAccountsCount">0</div>
                 </div>
@@ -1486,6 +1493,7 @@ const HTML_PAGE = `<!DOCTYPE html>
         let pageSize = 20;
         let taskStartTime = 0;
         let totalTaskCount = 0;
+        let filterMode = 'all'; // 'all' 或 'local'
 
         const $statusBadge = $('#statusBadge');
         const $startRegisterBtn = $('#startRegisterBtn');
@@ -1599,11 +1607,17 @@ const HTML_PAGE = `<!DOCTYPE html>
             }
         }
 
-        function renderTable(data = filteredAccounts) {
-            const totalPages = Math.ceil(data.length / pageSize);
+        function renderTable() {
+            // 根据过滤模式应用过滤
+            let displayData = filteredAccounts;
+            if (filterMode === 'local') {
+                displayData = filteredAccounts.filter(acc => acc.source === 'local');
+            }
+
+            const totalPages = Math.ceil(displayData.length / pageSize);
             const startIndex = (currentPage - 1) * pageSize;
             const endIndex = startIndex + pageSize;
-            const pageData = data.slice(startIndex, endIndex);
+            const pageData = displayData.slice(startIndex, endIndex);
 
             if (pageData.length === 0) {
                 $accountTableBody.html('<tr><td colspan="7" class="px-4 py-8 text-center text-gray-400">暂无数据</td></tr>');
@@ -1667,7 +1681,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             }
 
             // 更新分页控件
-            updatePagination(data.length, totalPages);
+            updatePagination(displayData.length, totalPages);
         }
 
         function updatePagination(totalItems, totalPages) {
@@ -1766,6 +1780,26 @@ const HTML_PAGE = `<!DOCTYPE html>
         }
 
         $('#refreshBtn').on('click', loadAccounts);
+
+        // 统计卡片点击事件 - 切换过滤模式
+        $('#totalAccountsCard').on('click', function() {
+            filterMode = 'all';
+            $('.stat-card').removeClass('active');
+            $(this).addClass('active');
+            currentPage = 1;
+            renderTable();
+        });
+
+        $('#localAccountsCard').on('click', function() {
+            filterMode = 'local';
+            $('.stat-card').removeClass('active');
+            $(this).addClass('active');
+            currentPage = 1;
+            renderTable();
+        });
+
+        // 默认选中总账号卡片
+        $('#totalAccountsCard').addClass('active');
 
         $('#clearLogBtn').on('click', function() {
             $logContainer.html('<div class="text-gray-500">日志已清空</div>');
